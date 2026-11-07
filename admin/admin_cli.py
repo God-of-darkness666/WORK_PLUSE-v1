@@ -22,6 +22,8 @@ import socket
 import threading
 import urllib.request
 import urllib.parse
+import time as _time
+import msvcrt          # windows keyboard poll (this GUI is Windows-only)
 
 from rich.console import Console
 from rich.panel import Panel
@@ -193,7 +195,7 @@ def pause():
     console.input("\n[dim]Press Enter to return to menu...[/dim]")
 
 
-def screen_dashboard(cfg: dict):
+def render_dashboard(cfg: dict):
     identities = list_identities(cfg)
     day = str(dt.date.today())
     console.rule(f"[bold cyan]DASHBOARD - today ({day})")
@@ -248,7 +250,32 @@ def screen_dashboard(cfg: dict):
     for i, (tab, s) in enumerate(tabs, 1):
         tt.add_row(str(i), tab[:60], hms(s))
     console.print(tt)
-    pause()
+
+
+def live_dashboard(cfg: dict, refresh: int = 10):
+    """LIVE WATCH: redrew the dashboard every `refresh` seconds until a key is pressed."""
+    try:
+        console.print(f"[yellow]LIVE WATCH started - auto refresh every {refresh}s."
+                      " Press any key to return to the menu...[/yellow]")
+        while True:
+            console.clear()
+            render_dashboard(cfg)
+            console.print(f"[yellow]LIVE WATCH - refreshing every {refresh}s. Press any key to return...[/yellow]")
+            deadline = _time.time() + refresh
+            while _time.time() < deadline:
+                if msvcrt.kbhit():
+                    msvcrt.getch()
+                    return
+                _time.sleep(0.2)
+    except KeyboardInterrupt:
+        return
+
+
+def screen_dashboard(cfg: dict):
+    render_dashboard(cfg)
+    ch = console.input("\n  [b]L[/b] = LIVE WATCH (auto-refresh)      [Enter] = back : ").strip().lower()
+    if ch == "l":
+        live_dashboard(cfg)
 
 
 def screen_users(cfg: dict):

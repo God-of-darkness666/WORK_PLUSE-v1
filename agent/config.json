@@ -1,0 +1,6 @@
+{
+  "server_path": "\\\\ADMIN-PC\\HRData",
+  "interval_seconds": 10,
+  "heartbeat_seconds": 30,
+  "location_enabled": true
+}

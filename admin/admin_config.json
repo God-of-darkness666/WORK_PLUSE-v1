@@ -1,0 +1,7 @@
+{
+  "data_path": "C:\\HRData",
+  "backup_path": "C:\\HRBackup",
+  "agent_exe": "C:\\work\\hr-monitor\\dist\\HRAgent.exe",
+  "cloud_url": "",
+  "api_key": ""
+}

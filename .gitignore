@@ -1,6 +1,14 @@
 build/
+dist/
 __pycache__/
 *.pyc
+*.spec
 .venv/
 venv/
 .env
+selfcheck_report.txt
+node_modules/
+mobile/app/build/
+mobile/.idea/
+mobile/local.properties
+agent/agent.log

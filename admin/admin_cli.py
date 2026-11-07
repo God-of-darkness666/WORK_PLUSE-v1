@@ -56,6 +56,7 @@ DEFAULT_CONFIG = {
     "data_path": r"C:\HRData",      # same folder agents write to
     "backup_path": r"C:\HRBackup",  # where backups / reports are stored
     "agent_exe": r"",               # full path to dist\HRAgent.exe (for export)
+    "mobile_apk": r"",              # full path to the built phone APK (for export)
     "cloud_url": "",                # e.g. https://hr-monitor-xxxx.onrender.com
     "api_key": "",                  # same secret as the server's HR_API_KEY
 }
@@ -332,6 +333,21 @@ def flip_disable(cfg: dict, ident: str):
         console.print(f"[yellow]DISABLED monitoring for {ident} (agent pauses within ~1 min).[/yellow]")
 
 
+def find_mobile_apk(cfg: dict) -> str:
+    """Where is the built phone APK? (settings value first, then auto-search)"""
+    cand = [cfg.get("mobile_apk", "")]
+    root = os.path.dirname(os.path.abspath(_app_dir()))     # project root (dist\..)
+    cand += [
+        os.path.join(root, "mobile", "app", "build", "outputs", "apk", "debug", "app-debug.apk"),
+        os.path.join(root, "mobile", "app", "build", "outputs", "apk", "debug", "app-debug.apk".replace("app-debug", "app-release")),
+        os.path.join(root, "mobile", "app", "build", "outputs", "apk", "release", "app-release.apk"),
+    ]
+    for p in cand:
+        if p and os.path.isfile(p):
+            return p
+    return ""
+
+
 def screen_export_agent(cfg: dict):
     console.rule("[bold cyan]EXPORT AGENT EXE (gives the employee-side EXE)")
     agent_exe = cfg.get("agent_exe", "")
@@ -369,10 +385,25 @@ def screen_export_agent(cfg: dict):
             f.write("HRAgent install steps (employee laptop)\n"
                     "=======================================\n"
                     "1. Copy HRAgent.exe and config.json into the same folder.\n"
-                    "2. config.json already points to the HR shared folder - do not edit it.\n"
+                    "2. config.json already points to the HR server - do not edit it.\n"
                     "3. Double-click HRAgent.exe once. It hides immediately,\n"
                     "   registers itself to start on every boot, and begins recording.\n"
                     "That's all.\n")
+
+        # ---------- phone side (APK) ----------
+        apk_src = find_mobile_apk(cfg)
+        if apk_src:
+            shutil.copy2(apk_src, os.path.join(dest, "HRMonitor-Mobile.apk"))
+            console.print(f"[green]Phone APK added to the kit: HRMonitor-Mobile.apk  ({os.path.basename(apk_src)})[/green]")
+            console.print("  Send HRMonitor-Mobile.apk to workers on WhatsApp/Drive/USB;")
+            console.print("  it installs via Android's package installer, then they enter the")
+            console.print("  same server + API key and tap START TRACKING.")
+        else:
+            console.print("[yellow]No phone APK found yet -> the kit contains only the PC EXE for now.[/yellow]")
+            console.print("[yellow]Build the APK once (see mobile\\README-MOBILE.md), then run Export again;")
+            console.print("[yellow]it will be picked up automatically from the mobile\\ build output.[/yellow]")
+
+        console.print(f"[green]Kit copied to {dest}.[/green]")
         console.print(f"[green]Kit copied to {dest} (HRAgent.exe + config.json + INSTALL-STEPS.txt).[/green]")
     except Exception as e:
         console.print(f"[red]Export failed: {e}[/red]")
@@ -388,6 +419,7 @@ def screen_settings(cfg: dict):
         console.print("  4) Backup records now (copy all records + PDFs into backup folder)")
         console.print("  5) Open records folder in Explorer")
         console.print(f"  6) Cloud settings (Render server)     : [green]{cfg.get('cloud_url') or 'not set'}[/green]")
+        console.print(f"  7) Mobile APK path (auto for Export)  : [green]{cfg.get('mobile_apk') or 'auto-detect'}[/green]")
         console.print("  B) Back")
         ch = console.input("  Choice: ").strip().lower()
         if ch == "1":
@@ -428,6 +460,11 @@ def screen_settings(cfg: dict):
                     console.print(f"[green]Cloud OK - server in '{d.get('mode')}' mode.[/green]")
                 except Exception as e:
                     console.print(f"[red]Cloud test FAILED: {e}[/red]")
+        elif ch == "7":
+            p = console.input("  Full path to the built APK (app-debug.apk, Enter = auto-detect from project): ").strip().strip('"')
+            cfg["mobile_apk"] = p; save_cfg(cfg)
+            if p and not os.path.isfile(p):
+                console.print("[yellow]File not found - Export will keep auto-detecting![/yellow]")
         elif ch == "b":
             return
 

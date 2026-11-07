@@ -10,16 +10,31 @@ Storage: **MongoDB Atlas free forever** (M0) — the server uses it automaticall
 
 ---
 
-## STEP 1 — Get a free MongoDB Atlas (3 min, once)
+## STEP 1 — Choose your free database (both free forever)
 
-1. Go to https://www.mongodb.com/cloud/atlas → **Sign up**.
-2. Create a **FREE M0 cluster** (512 MB, free forever).
-3. **Database Access** → *Add Database User*: user `hr`, auto-generate a password → **copy it**.
-4. **Network Access** → *Add IP Address* → **Allow access from anywhere (0.0.0.0/0)**.
-5. **Clusters → Connect → Driver (Python)** → copy the connection string, replace `<password>` with the real password. It looks like:
+The server picks its database AUTOMATICALLY from env vars. Choose ONE:
+
+### Option A — TiDB Cloud (MySQL-compatible, recommended)
+
+1. Sign up free: https://tidbcloud.com (Google/GitHub login).
+2. **Create cluster → Serverless (free)** → region closest to you (e.g. Singapore) → Create.
+3. Click **Connect** on the cluster → it shows:
    ```
-   mongodb+srv://hr:YOURPASSWORD@cluster0.abcde.mongodb.net/?retryWrites=true&w=majority
+   Host:     gateway01.<region>.prod.aws.tidbcloud.com
+   Port:     4000
+   User:     4XxXXxXb.root        ← copy exactly
+   Password: click to view/copy
    ```
+   TiDB Serverless requires TLS — the server code already does TLS automatically (no CA file needed; optional strict verify via env `MYSQL_SSL_CA_PATH`).
+4. You will turn those 4 values into env vars in STEP 4.
+
+### Option B — MongoDB Atlas
+
+1. https://www.mongodb.com/cloud/atlas → Sign up.
+2. **FREE M0 cluster** → `Database Access` → add user `hr` (auto password, copy it).
+3. `Network Access` → Allow 0.0.0.0/0.
+4. `Clusters → Connect → Driver (Python)` → replace `<password>` with the real password:
+   `mongodb+srv://hr:YOURPASSWORD@cluster0.abcde.mongodb.net/?retryWrites=true&w=majority`
 
 ## STEP 2 — Put the server code where Render can build it
 
@@ -42,13 +57,27 @@ You have two easy options:
    - **Build Command**: `pip install -r requirements.txt`
    - **Start Command**: `gunicorn app:app --bind 0.0.0.0:$PORT`
    - **Instance type**: Free
-5. **Environment → Add Environment Variable** (both are needed):
+5. **Environment → Add Environment Variable** (choose per your STEP 1 choice):
+
+   Always:
    ```
-   HR_API_KEY = put along secret here, e.g.  ravi-secret-2026-xyz
-   MONGO_URI  = the mongodb+srv://... string from STEP 1
+   HR_API_KEY =                 (any secret, e.g. ravi-secret-2026-xyz)
+   ```
+
+   If you chose TiDB:
+   ```
+   MYSQL_HOST     = gateway01.<region>.prod.aws.tidbcloud.com   (from Connect page)
+   MYSQL_PORT     = 4000
+   MYSQL_USER     = 4XxXXxXb.root                               (from Connect page)
+   MYSQL_PASSWORD = <the password from the Connect page>
+   ```
+
+   If you chose Mongo instead:
+   ```
+   MONGO_URI = mongodb+srv://hr:YOURPASSWORD@cluster0.abcde.mongodb.net/?retryWrites=true&w=majority
    ```
 6. **Create Web Service** → wait for "Deploy live".
-7. Your server URL is now `https://YOUR-SERVICE.onrender.com`. Test by opening it in a browser — it must show **"HRMonitor Cloud Server - RUNNING (mongo mode)"**.
+7. Your server URL is now `https://YOUR-SERVICE.onrender.com`. Open it in a browser — it must show **"HRMonitor Cloud Server - RUNNING (mysql mode)"** (or `mongo mode` per your choice).
 
 ## STEP 4 — Connect the admin side (HR PC)
 

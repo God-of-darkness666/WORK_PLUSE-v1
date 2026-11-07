@@ -99,7 +99,7 @@ class MainActivity : AppCompatActivity() {
         thread {
             try {
                 if (!s.startsWith("http")) s = if (s.firstOrNull()?.isDigit() == true) "http://$s" else "https://$s"
-                val conn = URL("$s/ping").openConnection() as HttpURLConnection
+                val conn = URL("$s/api/identity_list").openConnection() as HttpURLConnection
                 conn.connectTimeout = 8000
                 conn.readTimeout = 8000
                 conn.setRequestProperty("X-API-Key", key)
@@ -107,11 +107,15 @@ class MainActivity : AppCompatActivity() {
                 var body = JSONObject()
                 if (code == 200) {
                     body = JSONObject(conn.inputStream.bufferedReader().readText())
+                } else {
+                    try { body = JSONObject(conn.errorStream!!.bufferedReader().readText()) } catch (_: Exception) {}
                 }
                 conn.disconnect()
-                val res = if (code == 200)
-                    "Connection OK \u2713 (server mode: ${body.optString("mode")})"
-                else "Server answered HTTP $code — check API key"
+                val res = when {
+                    code == 200 -> "Connection OK \u2713  (server reached, API key ACCEPTED"
+                    code == 401 -> "Server reached, but API KEY is wrong - compare with Render HR_API_KEY"
+                    else -> "Server answered HTTP $code - check the server address"
+                }
                 runOnUiThread { tvStatus.text = res }
             } catch (e: Exception) {
                 runOnUiThread {

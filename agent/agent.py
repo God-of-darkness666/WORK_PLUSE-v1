@@ -174,6 +174,102 @@ def chrome_tab(title: str):
 
 
 # ----------------------------------------------------------------------------
+# Browser history (real visited links + web searches) - Chrome & Edge local DBs
+# ----------------------------------------------------------------------------
+CHROME_EPOCH_DELTA = 11644473600          # seconds between 1601-01-01 and 1970-01-01
+
+SEARCH_KEYS = ("q", "query", "p", "text", "wd", "k", "searchTerm", "search_query")
+
+
+def classify_url(url: str):
+    """True link analysis: ('search', typed search) or ('page', site/path)."""
+    u = urllib.parse.urlparse(url)
+    host = (u.netloc or "").lower()
+    qs = urllib.parse.parse_qs(u.query)
+    for k in SEARCH_KEYS:
+        if k in qs and qs[k] and qs[k][0]:
+            return "search", urllib.parse.unquote(qs[k][0])[:120]
+    # some searches are /search/<terms> (duckduckgo lite) or path based
+    if "yandex." in host and u.path.startswith("/search/"):
+        return "search", urllib.parse.unquote(u.path[len("/search/"):])[:120]
+    path = (u.path or "/").strip("/")
+    return "page", (host + ("/" + path if path else ""))[:120]
+
+
+def browser_dbs() -> list:
+    """All Chrome/Edge History databases of every profile on this PC."""
+    local = os.environ.get("LOCALAPPDATA", "")
+    if not local:
+        return []
+    out = []
+    for sub, app in ((os.path.join("Google", "Chrome"), "Chrome"),
+                     (os.path.join("Microsoft", "Edge"), "Edge")):
+        base = os.path.join(local, sub, "User Data")
+        if not os.path.isdir(base):
+            continue
+        for d in sorted(os.listdir(base)):
+            h = os.path.join(base, d, "History")
+            if os.path.isfile(h):
+                out.append((h, app))
+    return out
+
+
+def collect_browser_urls(s: dict) -> list:
+    """Every visit since the last check -> records with real URL or the search text."""
+    built = []
+    dbs = browser_dbs()
+    if not dbs:
+        return built
+    midnight = (dt.datetime.combine(dt.date.today(), dt.time.min).timestamp()
+                + CHROME_EPOCH_DELTA) * 1_000_000
+    tmpdir = os.path.join(cache_dir(), "hist_tmp")
+    os.makedirs(tmpdir, exist_ok=True)
+    import sqlite3
+    for idx, (hist, app) in enumerate(dbs):
+        seen = s.setdefault("url_last", {})
+        since = seen.get(str(idx), 0)
+        first = idx not in seen                      # first run -> only today's visits
+        after = midnight if first else max(since, midnight)
+        tmp = os.path.join(tmpdir, f"hist_{idx}.sqlite")
+        try:
+            shutil.copyfile(hist, tmp)               # original is locked by the browser
+            con = sqlite3.connect(tmp)
+            cur = con.cursor()
+            cur.execute(
+                "SELECT url, title, last_visit_time FROM urls "
+                "WHERE last_visit_time > ? ORDER BY last_visit_time LIMIT 40",
+                (int(after),))
+            newest = after
+            for url, title, t in cur.fetchall():
+                if not url or not url.startswith("http"):
+                    continue
+                newest = max(newest or 0, t)
+                ts = dt.datetime.fromtimestamp(t / 1_000_000 - CHROME_EPOCH_DELTA)
+                kind, detail = classify_url(url)
+                rec = {"ts": ts.isoformat(timespec="seconds"),
+                       "user": getpass.getuser(), "machine": socket.gethostname(),
+                       "exe": ("chrome.exe" if app == "Chrome" else "msedge.exe"),
+                       "app": app, "title": (title or detail)[:200],
+                       "secs": 0, "kind": "url",
+                       "url": url[:500], (kind if kind == "search" else "page"): detail}
+                built.append(rec)
+            seen[str(idx)] = newest
+            con.close()
+            os.remove(tmp)
+        except Exception as e:
+            log_err(f"collect_browser_urls({app}) error: {e}")
+    return built
+
+
+def flush_url_records(s: dict):
+    """Store / buffer the records produced by collect_browser_urls."""
+    for rec in collect_browser_urls(s):
+        append_record(os.path.join(cache_dir(), "users", IDENTITY, "day.jsonl"), rec)
+        if s["cloud_url"]:
+            s["cloud_buffer"].append(rec)
+
+
+# ----------------------------------------------------------------------------
 # Location (IP based, no database, cached 1 hour)
 # ----------------------------------------------------------------------------
 def refresh_location(enabled: bool):
@@ -521,6 +617,11 @@ def step(s: dict) -> None:
     elif disabled:
         s["current_app"], s["current_tab"], s["current_title"] = "(disabled by HR)", None, ""
 
+    # ---- every minute: collect real browser links + web searches ---------
+    if s.get("browser_history", True) and time.time() - s.get("last_urls", 0) >= 60:
+        s["last_urls"] = time.time()
+        flush_url_records(s)
+
     # ---- periodical: sync cache -> share (shared-folder mode only) ------
     if not s["cloud_url"] and time.time() - s["last_sync"] >= 30:
         s["last_sync"] = time.time()
@@ -597,6 +698,8 @@ def main() -> None:
         "current_app": "Idle",
         "current_tab": None,
         "current_title": "",
+        "last_urls": 0.0,
+        "url_last": {},
     }
     s["location"], s["ip"] = refresh_location(s["loc"])
     s["last_loc"] = time.time()

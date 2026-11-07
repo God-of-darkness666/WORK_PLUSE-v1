@@ -278,6 +278,79 @@ def screen_dashboard(cfg: dict):
         live_dashboard(cfg)
 
 
+def screen_worker_detail(cfg: dict):
+    """Deep per-worker view: EVERY app they used today + the actual links & searches,
+    refreshing live (any key returns)."""
+    identities = list_identities(cfg)
+    if not identities:
+        console.print("[yellow]No workers have reported yet. Run an agent first.[/yellow]")
+        pause(); return
+    console.rule("[bold cyan]WORKER DETAIL")
+    for i, ident in enumerate(identities, 1):
+        console.print(f"   {i}) {ident.replace('@', '  ')[:60]}")
+    ch = console.input("  Select worker # (Enter = 1): ").strip()
+    idx = 0
+    if ch:
+        try:
+            idx = int(ch) - 1
+        except ValueError:
+            return
+    if not (0 <= idx < len(identities)):
+        console.print("bad choice"); pause(); return
+    ident = identities[idx]
+    day = str(dt.date.today())
+    short = lambda url: (urllib.parse.urlparse(url).netloc + urllib.parse.urlparse(url).path)[:38]
+
+    console.print("[yellow]LIVE worker view - refreshes every 12s. Press any key to return...[/yellow]")
+    _time.sleep(1.0)
+    while True:
+        try:
+            console.clear()
+            st = read_status(cfg, ident)
+            state = state_of(cfg, ident, st)
+            console.rule(f"[bold cyan]DETAIL - {ident} - {day}")
+            console.print(f"  State: [bold]{state}[/bold]   Last seen: {st.get('last_seen','-')}   "
+                          f"Location: {st.get('location','-')}   IP: {st.get('ip','-')}")
+            console.print(f"  Right now: {st.get('current_app','-')}   "
+                          f"Chrome tab: {st.get('current_tab') or '-'}   "
+                          f"Window: {st.get('current_title') or '-'}")
+
+            recs = read_day_records(cfg, ident, day)
+            app_secs, _tab_secs = aggregate(recs)
+            apps = sorted(app_secs.items(), key=lambda x: -x[1])
+            t = Table(title=f"ALL APPLICATIONS USED TODAY ({len(apps)} apps)", box=box.SIMPLE, title_style="bold cyan")
+            t.add_column("#"); t.add_column("Application"); t.add_column("Time"); t.add_column("Usage")
+            max_sec = max([s for _, s in apps] + [1])
+            for i, (a, sec) in enumerate(apps, 1):
+                t.add_row(str(i), a[:34], hms(sec), "#" * max(1, int(sec * 30 / max_sec)))
+            console.print(t)
+
+            brows = [r for r in recs if r.get("url")]
+            console.print(f"[bold cyan]BROWSER ACTIVITY (real links + searches) - "
+                          f"{len(brows)} entries today[/bold cyan]")
+            bt = Table(box=box.SIMPLE)
+            bt.add_column("Time"); bt.add_column("Type"); bt.add_column("What"); bt.add_column("Page title")
+            for r in sorted(brows, key=lambda x: x.get("ts", ""))[-30:][::-1]:
+                if r.get("search"):
+                    typ, what = "[bright yellow]SEARCH[/bright yellow]", r["search"][:42]
+                    where = f"@ {short(r['url'])}"
+                else:
+                    typ, what = "LINK", short(r.get("url", ""))
+                    where = ""
+                bt.add_row(r.get("ts", "-")[11:16], typ, what, (r.get("title") or "")[:46])
+            console.print(bt)
+
+            console.print("[yellow]LIVE - updating every 12s. Press any key to return...[/yellow]")
+            deadline = _time.time() + 12
+            while _time.time() < deadline:
+                if msvcrt.kbhit():
+                    msvcrt.getch()
+                    return
+                _time.sleep(0.2)
+        except KeyboardInterrupt:
+            return
+
+
 def screen_users(cfg: dict):
     while True:
         console.rule("[bold cyan]USER MANAGEMENT")
@@ -760,6 +833,7 @@ def main():
         console.print("  [b]4)[/b] Settings         (records folder, backup folder, backup now)")
         console.print("  [b]5)[/b] Reports          (build PDF record for a user / date)")
         console.print("  [b]6)[/b] Phone sync        (start/stop server for worker PHONES - Android app)")
+        console.print("  [b]7)[/b] [bold]Worker detail[/bold]  (ALL apps used + real links & searches - LIVE)")
         console.print("  [b]0)[/b] Exit")
         ch = console.input("\n  Choose: ").strip()
         if ch == "1":
@@ -774,6 +848,8 @@ def main():
             screen_reports(cfg)
         elif ch == "6":
             screen_phone_server(cfg)
+        elif ch == "7":
+            screen_worker_detail(cfg)
         elif ch == "0":
             break
 

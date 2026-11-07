@@ -9,11 +9,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
-import android.content.pm.ServiceCompat
 import android.location.LocationManager
 import android.os.Build
 import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
+import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import org.json.JSONArray
 import org.json.JSONObject
@@ -84,7 +84,7 @@ class TrackerService : Service() {
 
     private fun localIp(): String = try {
         NetworkInterface.getNetworkInterfaces().toList().firstNotNullOfOrNull { nif ->
-            nif.inetAddresses.firstOrNull { !it.isLoopbackAddress && it.hostAddress.contains(".") }?.hostAddress
+            nif.inetAddresses.toList().firstOrNull { !it.isLoopbackAddress && it.hostAddress.contains(".") }?.hostAddress
         } ?: "unknown"
     } catch (e: Exception) {
         "unknown"

@@ -100,6 +100,16 @@ def cloud_post(cfg: dict, path: str, obj: dict) -> dict:
         return json.loads(r.read().decode("utf-8"))
 
 
+def log_admin_action(cfg: dict, action: str, target: str = "", result: str = "ok"):
+    """Security Core: every administrative action lands in the server audit trail."""
+    if not cfg.get("cloud_url"):
+        return
+    try:
+        cloud_post(cfg, "/api/audit", {"action": action, "target": target, "result": result})
+    except Exception:
+        pass
+
+
 # ----------------------------------------------------------------------------
 # Data reading (local shared folder AND/OR cloud - both are merged)
 # ----------------------------------------------------------------------------
@@ -351,6 +361,35 @@ def screen_worker_detail(cfg: dict):
             return
 
 
+def screen_security(cfg: dict):
+    """Security Core: view the server-side audit trail."""
+    console.rule("[bold cyan]SECURITY & AUDIT TRAIL")
+    if not cfg.get("cloud_url"):
+        console.print("[yellow]Cloud not configured - audit works in cloud mode.[/yellow]")
+        pause(); return
+    try:
+        data = cloud_get(cfg, "/api/audit")
+        rows = data.get("entries", [])
+        if data.get("error"):
+            console.print(f"[yellow]server note: {data['error']}[/yellow]")
+    except Exception as e:
+        console.print(f"[red]Cloud not reachable ({type(e).__name__})[/red]")
+        pause(); return
+    if not rows:
+        console.print("[yellow]No audit entries yet - actions like disabling a worker "
+                      "or exporting a kit will be recorded here.[/yellow]")
+        pause(); return
+    t = Table(title="AUDIT TRAIL (last 100, newest first)", box=box.SIMPLE, title_style="bold cyan")
+    for col in ("Time", "Admin", "Action", "Target", "Result"):
+        t.add_column(col)
+    for r in rows:
+        t.add_row(str(r.get("ts", ""))[:19], str(r.get("admin", ""))[:20],
+                  str(r.get("action", ""))[:24], str(r.get("target", ""))[:40],
+                  str(r.get("result", ""))[:24])
+    console.print(t)
+    pause()
+
+
 def screen_users(cfg: dict):
     while True:
         console.rule("[bold cyan]USER MANAGEMENT")
@@ -504,7 +543,7 @@ def screen_export_agent(cfg: dict):
             console.print("[yellow]it will be picked up automatically from the mobile\\ build output.[/yellow]")
 
         console.print(f"[green]Kit copied to {dest}.[/green]")
-        console.print(f"[green]Kit copied to {dest} (HRAgent.exe + config.json + INSTALL-STEPS.txt).[/green]")
+        log_admin_action(cfg, "kit.exported", dest[:150], "HRAgent.exe + APK bundled")
     except Exception as e:
         console.print(f"[red]Export failed: {e}[/red]")
     pause()
@@ -807,15 +846,13 @@ def build_pdf_for(cfg: dict, ident: str, day: str):
 # ----------------------------------------------------------------------------
 # Header + main menu ("command GUI")
 # ----------------------------------------------------------------------------
-BANNER = """\
-   __  __          _______  ____     __  __
-  /\\ \\/\\ \\        / ____\\| \\/\\ \\     /\\ \\/\\ \\
-  \\ \\ \\_\\ \\  ___  \\ \\___\\ \\ \\/\\ \\    \\ \\ \\_\\ \\
-   \\ \\  _  \\/ __ \\  \\  __ \\ \\  _  \\    \\ \\  _  \\
-    \\ \\ \\ \\ \\/ \\_\\ \\  \\ \\_\\ \\ \\ \\_\\ \\    \\ \\ \\ \\ \\
-     \\ \\_\\ \\_\\ \\____/   \\_\\ \\_\\ \\_\\ \\_\\    \\ \\_\\ \\_\\
-      \\/_/\\/_/ \\___/     \\/_/\\/ /\\/_/ \\/    \\/_/\\/_/
-          Employee Monitoring  -  Command GUI (no database)
+BANNER = r"""
+ __        ___     _   _                     ____         _
+ \ \      / (_) __| | | |__   __ _  ___ _ __ |  _ \ _   _| | _____
+  \ \ /\ / /| |/ _` | | '_ \ / _` |/ _ \ '__| | |_) | | | | |/ / __|
+   \ V  V / | | (_| | | |_) | (_| |  __/ |    |  __/| |_| |   <|\__ \
+    \_/\_/  |_|\__,_| |_.__/ \__,_|\___|_|    |_|    \__,_|_|\_\___/
+       AI Workforce Intelligence & Security  -  Monitor. Understand. Govern.
 """
 
 
@@ -834,6 +871,7 @@ def main():
         console.print("  [b]5)[/b] Reports          (build PDF record for a user / date)")
         console.print("  [b]6)[/b] Phone sync        (start/stop server for worker PHONES - Android app)")
         console.print("  [b]7)[/b] [bold]Worker detail[/bold]  (ALL apps used + real links & searches - LIVE)")
+        console.print("  [b]8)[/b] Security & audit (server-side trail of admin actions)")
         console.print("  [b]0)[/b] Exit")
         ch = console.input("\n  Choose: ").strip()
         if ch == "1":
@@ -850,6 +888,8 @@ def main():
             screen_phone_server(cfg)
         elif ch == "7":
             screen_worker_detail(cfg)
+        elif ch == "8":
+            screen_security(cfg)
         elif ch == "0":
             break
 

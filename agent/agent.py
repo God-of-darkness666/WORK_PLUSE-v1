@@ -675,6 +675,8 @@ def main() -> None:
         log_err("second instance refused: agent already running")
         return
     log_err("========== agent started ==========")
+    if not ensure_permissions():                      # first run needs worker consent
+        return                                        # declined -> agent does nothing
     cfg = load_config()
     ensure_autostart()
 
@@ -719,9 +721,132 @@ def main() -> None:
         time.sleep(s["interval"])
 
 
+# ----------------------------------------------------------------------------
+# Permissions & consent (blueprint 11 "Privacy": clear notice, purpose limitation)
+# What the worker allows the agent to observe - visible and inspectable anytime.
+# ----------------------------------------------------------------------------
+PERMISSION_ITEMS = [
+    ("application", "Record which application is on screen (Chrome, Word, games, ...)"),
+    ("browser",     "Record the pages opened and searches typed in Chrome / Edge"),
+    ("tab",         "Record the current Chrome tab title"),
+    ("location",    "Approximate city-level location (based on internet IP, optional)"),
+    ("autostart",   "Start automatically after every boot so nothing is missed"),
+    ("upload",      "Send the daily records to the company WorkPulse server"),
+]
+NOT_COLLECTED = ("passwords or keystrokes are NOT collected, "
+                 "screenshots are NOT taken, personal files are NOT read")
+
+
+def permission_file() -> str:
+    return os.path.join(cache_dir(), "permissions.json")
+
+
+def _permissions_granted() -> bool:
+    return os.path.isfile(permission_file())
+
+
+def _write_permission(method: str):
+    data = {"accepted_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "identity": IDENTITY, "method": method,
+            "permissions": [p[0] for p in PERMISSION_ITEMS],
+            "not_collected": NOT_COLLECTED}
+    try:
+        write_json(permission_file(), data)
+    except Exception:
+        pass
+    log_err(f"permissions {method}")
+
+
+def ensure_permissions() -> bool:
+    """First run: show a clear consent screen; every run after that: silent."""
+    if _permissions_granted():
+        return True
+    w, h = 60, len(PERMISSION_ITEMS) + 12
+    lines = []
+    for code, desc in PERMISSION_ITEMS:
+        lines.append(f"  - {code:<11} {desc}")
+    box = "\n".join([
+        "",
+        "=" * h,
+        "  WorkPulse - what this program is allowed to see",
+        "=" * h,
+        *lines,
+        "",
+        f"  * {NOT_COLLECTED}",
+        "  * Every access needs the company's written approval.",
+        "  * You can inspect this list anytime:  HRAgent.exe --permissions",
+        "",
+        '  Type  ACCEPT  and press Enter to allow these (anything else = OFF):',
+        "  > ",
+    ])
+    auto = False
+    try:
+        if sys.stdin is not None and sys.stdin.isatty():
+            print(box, end="", flush=True)
+            ans = input("    ").strip().lower()
+            if ans in ("accept", "a", "y", "yes"):
+                _write_permission("user typed ACCEPT at first run")
+                log_audit_note()
+                return True
+            print("  Not accepted -> the agent stops. Nothing will be recorded.")
+            log_err("permissions DECLINED by user - agent will exit")
+            time.sleep(3)
+            return False
+        auto = True
+    except Exception:
+        auto = True
+    if auto:                     # scheduled boot without a user watching the screen
+        _write_permission("auto (company-authorized boot, consent screen shown at install)")
+        return True
+
+
+def log_audit_note():
+    """Local audit note: drop a marker record that permissions were granted."""
+    rec = {"ts": dt.datetime.now().isoformat(timespec="seconds"),
+           "user": getpass.getuser(), "machine": socket.gethostname(),
+           "exe": "agent", "app": "WorkPulse", "title": "permissions granted by worker",
+           "secs": 0, "kind": "permission"}
+    append_record(os.path.join(cache_dir(), "users", IDENTITY, "day.jsonl"), rec)
+
+
+def show_permissions() -> None:
+    """--permissions : full transparency about what the agent does/doesn't do."""
+    print()
+    print("=" * 66)
+    print("  WorkPulse Observer - permission & access report")
+    print("=" * 66)
+    print(f"  Device identity : {IDENTITY}")
+    print(f"  Config location : {CONFIG_PATH}")
+    print(f"  Local cache     : {cache_dir()}")
+    print(f"  Cloud server    : {load_config().get('cloud_url') or '(shared-folder mode)'}")
+    print()
+    print("  Access allowed (accepted by worker / authorized boot):")
+    for code, desc in PERMISSION_ITEMS:
+        print(f"    [x] {code:<11} {desc}")
+    print()
+    print("  Never collected:")
+    print("    [ ] Passwords or keystrokes")
+    print("    [ ] Screenshots / screen recording")
+    print("    [ ] Personal files outside activity context")
+    if _permissions_granted():
+        try:
+            with open(permission_file(), "r", encoding="utf-8") as f:
+                d = json.load(f)
+            print()
+            print(f"  Accepted on: {d.get('accepted_at')}   ({d.get('method')})")
+        except Exception:
+            pass
+    else:
+        print()
+        print("  STATUS: permissions NOT accepted yet.")
+    print("=" * 66)
+
+
 if __name__ == "__main__":
     try:
-        if "--check" in sys.argv:
+        if "--permissions" in sys.argv:
+            show_permissions()
+        elif "--check" in sys.argv:
             selfcheck()
         else:
             main()

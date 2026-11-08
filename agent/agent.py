@@ -558,16 +558,15 @@ def ensure_watchdog() -> None:
     if not getattr(sys, "frozen", False):
         return
     try:
+        import subprocess
         exe = sys.executable
-        wd = os.path.join(cache_dir(), "watchdog.cmd")
-        with open(wd, "w", encoding="utf-8") as f:
-            f.write("@echo off\n"
-                    'tasklist /FI "IMAGENAME eq HRAgent.exe" 2>nul | find /I '
-                    '"HRAgent.exe" >nul\n'
-                    f'if errorlevel 1 start "" "{exe}"\n')
-        os.system(f'schtasks /Create /F /TN "WorkPulseWatchdog" /SC MINUTE /MO 1 '
-                  f'/TR "cmd /c {wd}" >nul 2>&1')
-        chk = os.popen('schtasks /Query /TN "WorkPulseWatchdog"').read()
+        # launch the EXE DIRECTLY (cmd /c wrappers fail inside Task Scheduler);
+        # the agent's single-instance mutex makes any extra launch self-terminate
+        subprocess.run(["schtasks", "/Create", "/F", "/TN", "WorkPulseWatchdog",
+                        "/SC", "MINUTE", "/MO", "1", "/TR", exe],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        chk = subprocess.run(["schtasks", "/Query", "/TN", "WorkPulseWatchdog"],
+                             capture_output=True, text=True).stdout
         if "WorkPulseWatchdog" in chk:
             log_err("watchdog armed: WorkPulseWatchdog task restarts the agent "
                     "within 60s if it is killed")

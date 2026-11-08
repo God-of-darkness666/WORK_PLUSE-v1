@@ -105,13 +105,20 @@ if MODE == "memory" and MYSQL_HOST:
 
         def m_save_records(ident, rows):
             c = _sql(); cur = c.cursor()
+            stored = 0
             for r in rows:
+                data = json.dumps(r, ensure_ascii=False)
+                # duplicate-proof: skip a record that is already stored byte-identical
                 cur.execute(
-                    "INSERT INTO records_tbl (identity, day, ts, data) VALUES (%s,%s,%s,%s)",
-                    (ident, str(r.get("ts", ""))[:10], str(r.get("ts", ""))[:30],
-                     json.dumps(r, ensure_ascii=False)))
+                    "INSERT INTO records_tbl (identity, day, ts, data) "
+                    "SELECT %s, %s, %s, %s WHERE NOT EXISTS ("
+                    "  SELECT 1 FROM records_tbl"
+                    "  WHERE identity=%s AND ts=%s AND data=%s)",
+                    (ident, str(r.get("ts", ""))[:10], str(r.get("ts", ""))[:30], data,
+                     ident, str(r.get("ts", ""))[:30], data))
+                stored += cur.rowcount > 0
             c.close()
-            return len(rows)
+            return stored
 
         def m_upsert_status(ident, st):
             c = _sql(); cur = c.cursor()

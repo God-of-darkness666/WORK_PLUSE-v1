@@ -267,6 +267,32 @@ def flush_url_records(s: dict):
         append_record(os.path.join(cache_dir(), "users", IDENTITY, "day.jsonl"), rec)
         if s["cloud_url"]:
             s["cloud_buffer"].append(rec)
+    save_url_state(s)                       # remember position even across restarts
+
+
+def _url_state_file() -> str:
+    return os.path.join(cache_dir(), "url_state.json")
+
+
+def save_url_state(s: dict):
+    try:
+        write_json(_url_state_file(), s.get("url_last", {}))
+    except Exception:
+        pass
+
+
+def load_url_state(s: dict):
+    """Loading the persisted last-visit positions means a restart does NOT
+    re-collect the whole day's browser history (no duplicate tabs)."""
+    try:
+        p = _url_state_file()
+        if os.path.isfile(p):
+            with open(p, "r", encoding="utf-8") as f:
+                st = json.load(f)
+            if isinstance(st, dict):
+                s["url_last"] = st
+    except Exception:
+        pass
 
 
 # ----------------------------------------------------------------------------
@@ -724,6 +750,7 @@ def main() -> None:
         "last_open_app": None,
         "last_event_post": 0.0,
     }
+    load_url_state(s)                 # resume browser-history position (no duplicate tabs)
     s["location"], s["ip"] = refresh_location(s["loc"])
     s["last_loc"] = time.time()
     if s["cloud_url"]:

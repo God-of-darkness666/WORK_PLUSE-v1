@@ -329,6 +329,13 @@ def screen_worker_detail(cfg: dict):
 
             opened = [r for r in recs if r.get("kind") == "event"
                       and r.get("event") == "app_opened"]
+            seen_open, uniq_open = set(), []
+            for r in opened:                       # dedupe: same ts+app+title = same open
+                key = (r.get("ts"), r.get("app"), r.get("title"))
+                if key not in seen_open:
+                    seen_open.add(key)
+                    uniq_open.append(r)
+            opened = uniq_open
             t_open = Table(title=f"OPENED NOW - live feed, newest first ({len(opened)} opens today)",
                            box=box.SIMPLE, title_style="bold green")
             t_open.add_column("Time"); t_open.add_column("Application"); t_open.add_column("Window / tab title")
@@ -347,6 +354,13 @@ def screen_worker_detail(cfg: dict):
             console.print(t)
 
             brows = [r for r in recs if r.get("url")]
+            seen_url, uniq_brows = set(), []
+            for r in sorted(brows, key=lambda x: x.get("ts", "")):
+                key = (r.get("ts"), r.get("url"), r.get("search") or r.get("page"))
+                if key not in seen_url:            # dedupe: same visit stored twice
+                    seen_url.add(key)
+                    uniq_brows.append(r)
+            brows = uniq_brows
             console.print(f"[bold cyan]BROWSER ACTIVITY (real links + searches) - "
                           f"{len(brows)} entries today[/bold cyan]")
             bt = Table(box=box.SIMPLE)

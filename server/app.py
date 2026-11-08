@@ -212,6 +212,8 @@ if MODE == "mongo":
                     doc["search"] = str(r["search"])[:200]
                 else:
                     doc["page"] = str(r.get("page") or "")[:200]
+            elif r.get("kind") == "event":             # live "opened" feed records
+                doc.update(kind="event", event=str(r.get("event") or "")[:40])
             doc["day"] = str(doc["ts"])[:10]
             _records.insert_one(doc)
         return len(rows)
@@ -268,6 +270,8 @@ else:  # memory
                     doc["search"] = str(r["search"])[:200]
                 else:
                     doc["page"] = str(r.get("page") or "")[:200]
+            elif r.get("kind") == "event":             # live "opened" feed records
+                doc.update(kind="event", event=str(r.get("event") or "")[:40])
             doc["day"] = str(doc["ts"])[:10]
             _records_rows.append(doc)
         return len(rows)

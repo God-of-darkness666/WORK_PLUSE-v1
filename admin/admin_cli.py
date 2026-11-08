@@ -326,6 +326,17 @@ def screen_worker_detail(cfg: dict):
                           f"Window: {st.get('current_title') or '-'}")
 
             recs = read_day_records(cfg, ident, day)
+
+            opened = [r for r in recs if r.get("kind") == "event"
+                      and r.get("event") == "app_opened"]
+            t_open = Table(title=f"OPENED NOW - live feed, newest first ({len(opened)} opens today)",
+                           box=box.SIMPLE, title_style="bold green")
+            t_open.add_column("Time"); t_open.add_column("Application"); t_open.add_column("Window / tab title")
+            for r in opened[-25:][::-1]:
+                t_open.add_row(r.get("ts", "-")[11:16], (r.get("app") or r.get("exe", ""))[:30],
+                               (r.get("title") or "")[:60])
+            console.print(t_open)
+
             app_secs, _tab_secs = aggregate(recs)
             apps = sorted(app_secs.items(), key=lambda x: -x[1])
             t = Table(title=f"ALL APPLICATIONS USED TODAY ({len(apps)} apps)", box=box.SIMPLE, title_style="bold cyan")

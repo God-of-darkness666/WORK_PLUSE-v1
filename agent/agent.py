@@ -599,11 +599,15 @@ def step(s: dict) -> None:
         exe, title = fg
         app = FRIENDLY_NAMES.get(exe.lower(), exe)
         tab = chrome_tab(title) if exe.lower().startswith("chrome") else None
+        opened_now = (app != s.get("last_open_app"))          # worker switched to a new app
+        if opened_now:
+            s["last_open_app"] = app
         s["current_app"], s["current_title"], s["current_tab"] = app, title, tab
         s["app_secs"][app] = s["app_secs"].get(app, 0) + secs
         if tab:
             s["tab_secs"][tab] = s["tab_secs"].get(tab, 0) + secs
-        record = {"ts": dt.datetime.now().isoformat(timespec="seconds"),
+        ts_now = dt.datetime.now().isoformat(timespec="seconds")
+        record = {"ts": ts_now,
                   "user": getpass.getuser(), "machine": socket.gethostname(),
                   "exe": exe, "app": app, "title": title[:200], "secs": secs}
         if tab:
@@ -614,6 +618,21 @@ def step(s: dict) -> None:
             s["cloud_buffer"].append(record)
             if len(s["cloud_buffer"]) > 2000:            # if the cloud is off for days
                 del s["cloud_buffer"][:1000]
+        if opened_now:                                   # instant "OPENED" feed for the admin
+            event = {"ts": ts_now, "kind": "event", "event": "app_opened",
+                     "user": getpass.getuser(), "machine": socket.gethostname(),
+                     "exe": exe, "app": app, "title": title[:200]}
+            if tab:
+                event["tab"] = tab[:200]
+            append_record(os.path.join(cache_dir(), "users", IDENTITY, "day.jsonl"), event)
+            if s["cloud_url"]:
+                s["cloud_buffer"].append(event)
+                if time.time() - s.get("last_event_post", 0) >= 2:   # INSTANT live feed
+                    s["last_event_post"] = time.time()
+                    if post_cloud(s, {"current_app": app, "current_title": title,
+                                      "current_tab": tab, "last_seen": ts_now},
+                                  s["cloud_buffer"]):
+                        s["cloud_buffer"].clear()
     elif disabled:
         s["current_app"], s["current_tab"], s["current_title"] = "(disabled by HR)", None, ""
 
@@ -702,6 +721,8 @@ def main() -> None:
         "current_title": "",
         "last_urls": 0.0,
         "url_last": {},
+        "last_open_app": None,
+        "last_event_post": 0.0,
     }
     s["location"], s["ip"] = refresh_location(s["loc"])
     s["last_loc"] = time.time()

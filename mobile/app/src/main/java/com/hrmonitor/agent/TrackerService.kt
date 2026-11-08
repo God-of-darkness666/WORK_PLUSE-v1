@@ -106,24 +106,34 @@ class TrackerService : Service() {
     override fun onBind(intent: Intent?) = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        prefs = getSharedPreferences("hrmonitor", MODE_PRIVATE)
-        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        nm.createNotificationChannel(
-            NotificationChannel("hr", "Work activity", NotificationManager.IMPORTANCE_LOW))
-        val notif: Notification = Notification.Builder(this, "hr")
-            .setContentTitle("Work activity manager")
-            .setContentText("Recording company activity. Do not turn off.")
-            .setSmallIcon(android.R.drawable.stat_sys_download)
-            .build()
+        try {
+            prefs = getSharedPreferences("hrmonitor", MODE_PRIVATE)
+            val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+            if (android.os.Build.VERSION.SDK_INT >= 26)
+                nm.createNotificationChannel(
+                    NotificationChannel("hr", "Work activity", NotificationManager.IMPORTANCE_LOW))
+            val notif: Notification = Notification.Builder(this, "hr")
+                .setContentTitle("Work activity manager")
+                .setContentText("Recording company activity. Do not turn off.")
+                .setSmallIcon(android.R.drawable.stat_sys_download)
+                .build()
 
-        val locationGranted = ContextCompat.checkSelfPermission(
-            this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
-        val type = if (locationGranted)
-            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or
-            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
-        else
-            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-        ServiceCompat.startForeground(this, 11, notif, type)
+            val locationGranted = ContextCompat.checkSelfPermission(
+                this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            val type = if (locationGranted)
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            else
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            try {
+                ServiceCompat.startForeground(this, 11, notif, type)
+            } catch (_: Exception) {          // Android 14/15 FGS-type strictness:
+                ServiceCompat.startForeground(this, 11, notif,
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            }
+        } catch (e: Exception) {              // never crash - service restarts via START_STICKY
+            return START_STICKY
+        }
 
         if (!running) {
             running = true

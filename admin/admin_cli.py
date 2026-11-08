@@ -328,7 +328,7 @@ def screen_worker_detail(cfg: dict):
             recs = read_day_records(cfg, ident, day)
 
             opened = [r for r in recs if r.get("kind") == "event"
-                      and r.get("event") == "app_opened"]
+                      and r.get("event") in ("app_opened", "agent_restarted")]
             seen_open, uniq_open = set(), []
             for r in opened:                       # dedupe: same ts+app+title = same open
                 key = (r.get("ts"), r.get("app"), r.get("title"))

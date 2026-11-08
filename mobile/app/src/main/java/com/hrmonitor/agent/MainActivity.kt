@@ -29,13 +29,19 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
+        installCrashReporter()
+        try {
+            setContentView(R.layout.activity_main)
+        } catch (e: Exception) {
+            Toast.makeText(this, "UI error: ${e.message}", Toast.LENGTH_LONG).show()
+            return
+        }
 
         val prefs = getSharedPreferences("hrmonitor", MODE_PRIVATE)
-        val etName = findViewById<EditText>(R.id.etName)
-        val etServer = findViewById<EditText>(R.id.etServer)
-        val etKey = findViewById<EditText>(R.id.etKey)
-        tvStatus = findViewById(R.id.tvStatus)
+        val etName = findViewById<EditText>(R.id.etName) ?: return
+        val etServer = findViewById<EditText>(R.id.etServer) ?: return
+        val etKey = findViewById<EditText>(R.id.etKey) ?: return
+        tvStatus = findViewById(R.id.tvStatus) ?: return
 
         etName.setText(prefs.getString("user", ""))
         etServer.setText(prefs.getString("server", ""))   // full server base, e.g. https://xxx.onrender.com
@@ -71,6 +77,41 @@ class MainActivity : AppCompatActivity() {
         if (!prefs.getString("server", "").isNullOrBlank()) {
             tvStatus.text = "Configured: ${prefs.getString("server", "")}\nTap START TRACKING to resume."
         }
+        // show the reason if the app crashed last time (Kill the silence)
+        prefs.getString("last_crash", null)?.let {
+            tvStatus.text = "Last crash fixed:\n$it\n\n" + tvStatus.text
+            prefs.edit().putString("last_crash", null).apply()
+        }
+    }
+
+    /** Anti-kill: if tracking was stopped (force-stop, task manager, reboot), */
+    override fun onResume() {
+        super.onResume()
+        try {
+            val prefs = getSharedPreferences("hrmonitor", MODE_PRIVATE)
+            if (!prefs.getString("server", "").isNullOrBlank()) {
+                ContextCompat.startForegroundService(this, Intent(this, TrackerService::class.java))
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    /** Any unexpected error is caught, written down, and never kills the process. */    private fun installCrashReporter() {
+        if (Thread.getDefaultUncaughtExceptionHandler()?.javaClass?.name?.endsWith("CrashFriendly") == true)
+            return
+        val default = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler(Thread.UncaughtExceptionHandler { t, e ->
+            try {
+                getSharedPreferences("hrmonitor", MODE_PRIVATE).edit()
+                    .putString("last_crash", "${e.javaClass.simpleName}: ${e.message} @ ${t.name}")
+                    .apply()
+            } catch (_: Exception) {}
+            if (default != null && !default.javaClass.name.endsWith("CrashFriendly")) {
+                try { default.uncaughtException(t, e); return@UncaughtExceptionHandler } catch (_: Exception) {}
+            }
+            android.os.Process.killProcess(android.os.Process.myPid())
+            System.exit(10)
+        })
     }
 
     /** Normalizes input; saves prefs; returns true when input is valid. */

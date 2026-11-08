@@ -14,7 +14,7 @@
         android:allowBackup="false"
         android:label="HRMonitor"
         android:usesCleartextTraffic="true"
-        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
 
         <activity
             android:name=".MainActivity"

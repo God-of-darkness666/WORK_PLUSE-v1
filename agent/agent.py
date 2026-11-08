@@ -95,6 +95,14 @@ DEFAULT_CONFIG = {
     "location_enabled": True,              # IP based city-level location
 }
 
+# Anti-bypass: these are locked INSIDE the EXE at build time. If a worker
+# deletes / empties / edits config.json (remove server & key -> "go invisible"),
+# the agent silently reverts to these -> tampering cannot break monitoring.
+BUILD_LOCK = {
+    "cloud_url": "https://work-pluse-v1.onrender.com/",
+    "api_key": "hr-secret-2026-naveen",
+}
+
 IDENTITY = f"{getpass.getuser()}@{socket.gethostname()}"
 
 
@@ -115,6 +123,7 @@ def log_err(message: str) -> None:
 # ----------------------------------------------------------------------------
 def load_config() -> dict:
     cfg = dict(DEFAULT_CONFIG)
+    tampered = False
     try:
         if os.path.exists(CONFIG_PATH):
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -123,6 +132,16 @@ def load_config() -> dict:
             save_config(cfg)                     # create default config next to EXE
     except Exception as e:
         log_err(f"config load error: {e}")
+    if getattr(sys, "frozen", False):
+        # tamper protection: a frozen agent can never lose the cloud settings
+        if not str(cfg.get("cloud_url", "") or "").strip() and BUILD_LOCK["cloud_url"]:
+            cfg["cloud_url"] = BUILD_LOCK["cloud_url"]
+            tampered = True
+        if not str(cfg.get("api_key", "") or "").strip() and BUILD_LOCK["api_key"]:
+            cfg["api_key"] = BUILD_LOCK["api_key"]
+            tampered = True
+        if tampered:
+            log_err("config.json was deleted/edited -> reverted to BUILT-IN locked settings")
     return cfg
 
 
@@ -516,6 +535,48 @@ def autostart_status() -> str:
         return f"unknown ({e})"
 
 
+def log_restart_event(cloud_url: str):
+    """Tell the admin this agent (re)started - reveals taskkill/watchdog battles."""
+    try:
+        rec = {"ts": dt.datetime.now().isoformat(timespec="seconds"),
+               "kind": "event", "event": "agent_restarted",
+               "user": getpass.getuser(), "machine": socket.gethostname(),
+               "exe": "HRAgent.exe", "app": "(agent restarted)",
+               "title": "agent was restarted (possible kill attempt or boot)", "secs": 0}
+        append_record(os.path.join(cache_dir(), "users", IDENTITY, "day.jsonl"), rec)
+    except Exception:
+        pass
+
+
+def ensure_watchdog() -> None:
+    """Anti-bypass: a Windows scheduled task restarts the agent every minute.
+
+    taskkill /IM HRAgent.exe /F (or any other kill) only buys 60 seconds:
+    the WorkPulseWatchdog task relaunches the agent and the admin's feed shows
+    the restart event. Recreated on every agent start so the path stays correct.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        exe = sys.executable
+        wd = os.path.join(cache_dir(), "watchdog.cmd")
+        with open(wd, "w", encoding="utf-8") as f:
+            f.write("@echo off\n"
+                    'tasklist /FI "IMAGENAME eq HRAgent.exe" 2>nul | find /I '
+                    '"HRAgent.exe" >nul\n'
+                    f'if errorlevel 1 start "" "{exe}"\n')
+        os.system(f'schtasks /Create /F /TN "WorkPulseWatchdog" /SC MINUTE /MO 1 '
+                  f'/TR "cmd /c {wd}" >nul 2>&1')
+        chk = os.popen('schtasks /Query /TN "WorkPulseWatchdog"').read()
+        if "WorkPulseWatchdog" in chk:
+            log_err("watchdog armed: WorkPulseWatchdog task restarts the agent "
+                    "within 60s if it is killed")
+        else:
+            log_err("watchdog task could not be created (needs a normal user session)")
+    except Exception as e:
+        log_err(f"watchdog error: {e}")
+
+
 # ----------------------------------------------------------------------------
 # SELF CHECK:  cmd:  HRAgent.exe --check
 # ----------------------------------------------------------------------------
@@ -724,6 +785,8 @@ def main() -> None:
         return                                        # declined -> agent does nothing
     cfg = load_config()
     ensure_autostart()
+    ensure_watchdog()
+    log_restart_event(cfg.get("cloud_url") or "")
 
     s = {
         "server": cfg["server_path"],

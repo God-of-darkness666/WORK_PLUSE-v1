@@ -487,6 +487,49 @@ def find_mobile_apk(cfg: dict) -> str:
     return ""
 
 
+def robust_copy(src: str, dst: str, label: str) -> bool:
+    """Copy that survives a LOCKED destination file.
+
+    Problem: exporting into the folder where HRAgent.exe is currently running
+    fails with 'file is being used by another process'. Fix:
+      attempt normal copy -> on PermissionError stop the running agent,
+      wait for Windows to release the handle, retry, then replace atomically.
+    SameFileError (src == dst) is skipped silently - that file is already there.
+    """
+    if os.path.abspath(src) == os.path.abspath(dst):
+        return True                                    # nothing to do, already correct
+    last_err = None
+    for attempt in (1, 2, 3):
+        try:
+            shutil.copy2(src, dst)
+            return True
+        except PermissionError as e:                   # file locked (running agent)
+            last_err = e
+            if attempt == 1:
+                console.print(f"[yellow]{label} is locked by a running HRAgent.exe - "
+                              "stopping it, then retrying...[/yellow]")
+                os.system("taskkill /IM HRAgent.exe /F >nul 2>&1")
+                _time.sleep(3)                           # let Windows release the handle
+        except shutil.SameFileError:
+            return True
+        except Exception as e:
+            last_err = e
+            break
+    # final fallback: write to a temp file next to dst, then swap it in
+    try:
+        tmp = dst + ".new"
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
+        return True
+    except Exception:
+        console.print(f"[red]{label}: could not copy -> "
+                      f"{last_err or 'destination folder permission denied'}[/red]")
+        console.print("[yellow]Tip: close/stop HRAgent.exe on the target PC "
+                      "(taskkill /IM HRAgent.exe /F) or pick another folder "
+                      "such as C:\\HRAgentKit, then run Export again.[/yellow]")
+        return False
+
+
 def screen_export_agent(cfg: dict):
     console.rule("[bold cyan]EXPORT AGENT EXE (gives the employee-side EXE)")
     agent_exe = cfg.get("agent_exe", "")
@@ -504,14 +547,16 @@ def screen_export_agent(cfg: dict):
     dest = console.input("Destination folder to copy the EXE to (Enter = USB folder C:\\\\HRAgentKit): ").strip().strip('"') or r"C:\HRAgentKit"
     try:
         os.makedirs(dest, exist_ok=True)
-        shutil.copy2(agent_exe, os.path.join(dest, "HRAgent.exe"))
+        ok = robust_copy(agent_exe, os.path.join(dest, "HRAgent.exe"), "HRAgent.exe")
+        if not ok:
+            pause(); return
         # also copy a pre-filled config so the employee needs zero setup
         src_cfg = os.path.join(os.path.dirname(agent_exe), "config.json")
         agent_src_cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agent", "config.json")
         if os.path.isfile(src_cfg):
-            shutil.copy2(src_cfg, os.path.join(dest, "config.json"))
+            robust_copy(src_cfg, os.path.join(dest, "config.json"), "config.json")
         elif os.path.isfile(agent_src_cfg):
-            shutil.copy2(agent_src_cfg, os.path.join(dest, "config.json"))
+            robust_copy(agent_src_cfg, os.path.join(dest, "config.json"), "config.json")
         else:
             with open(os.path.join(dest, "config.json"), "w") as f:
                 json.dump({"server_path": cfg["data_path"],
@@ -525,18 +570,19 @@ def screen_export_agent(cfg: dict):
                     "=======================================\n"
                     "1. Copy HRAgent.exe and config.json into the same folder.\n"
                     "2. config.json already points to the HR server - do not edit it.\n"
-                    "3. Double-click HRAgent.exe once. It hides immediately,\n"
-                    "   registers itself to start on every boot, and begins recording.\n"
+                    "3. Double-click HRAgent.exe once.\n"
+                    "4. On the consent screen type ACCEPT to allow monitoring\n"
+                    "   (run HRAgent.exe --permissions anytime to inspect what it sees).\n"
                     "That's all.\n")
 
         # ---------- phone side (APK) ----------
         apk_src = find_mobile_apk(cfg)
         if apk_src:
-            shutil.copy2(apk_src, os.path.join(dest, "HRMonitor-Mobile.apk"))
-            console.print(f"[green]Phone APK added to the kit: HRMonitor-Mobile.apk  ({os.path.basename(apk_src)})[/green]")
-            console.print("  Send HRMonitor-Mobile.apk to workers on WhatsApp/Drive/USB;")
-            console.print("  it installs via Android's package installer, then they enter the")
-            console.print("  same server + API key and tap START TRACKING.")
+            if robust_copy(apk_src, os.path.join(dest, "HRMonitor-Mobile.apk"), "HRMonitor-Mobile.apk"):
+                console.print(f"[green]Phone APK added to the kit: HRMonitor-Mobile.apk  ({os.path.basename(apk_src)})[/green]")
+                console.print("  Send HRMonitor-Mobile.apk to workers on WhatsApp/Drive/USB;")
+                console.print("  it installs via Android's package installer, then they enter the")
+                console.print("  same server + API key and tap START TRACKING.")
         else:
             console.print("[yellow]No phone APK found yet -> the kit contains only the PC EXE for now.[/yellow]")
             console.print("[yellow]Build the APK once (see mobile\\README-MOBILE.md), then run Export again;")

@@ -533,9 +533,23 @@ def robust_copy(src: str, dst: str, label: str) -> bool:
 def screen_export_agent(cfg: dict):
     console.rule("[bold cyan]EXPORT AGENT EXE (gives the employee-side EXE)")
     agent_exe = cfg.get("agent_exe", "")
+    if agent_exe and os.path.isdir(agent_exe) and os.path.isfile(os.path.join(agent_exe, "HRAgent.exe")):
+        agent_exe = os.path.join(agent_exe, "HRAgent.exe")   # saved path was a folder -> repair
+        cfg["agent_exe"] = agent_exe
+        save_cfg(cfg)
     if not agent_exe or not os.path.isfile(agent_exe):
         console.print(f"Current agent EXE path: [red]not set[/red]")
-        agent_exe = console.input("Enter full path to HRAgent.exe (e.g. C:\\code\\hr-monitor\\dist\\HRAgent.exe): ").strip().strip('"')
+        console.print("[green]Paste the FOLDER or the full path to HRAgent.exe - both work.[/green]")
+        agent_exe = console.input("Location (e.g. C:\\Desktop\\WORKPLUSE USER): ").strip().strip('"')
+        p = agent_exe
+        if os.path.isdir(p):                                # pasted the folder -> find the EXE inside
+            cand = os.path.join(p, "HRAgent.exe")
+            if os.path.isfile(cand):
+                agent_exe = cand
+                console.print(f"[green]Found agent EXE in that folder: {agent_exe}[/green]")
+            else:
+                console.print("[red]That folder has no HRAgent.exe inside.[/red]")
+                pause(); return
         if agent_exe and os.path.isfile(agent_exe):
             cfg["agent_exe"] = agent_exe
             save_cfg(cfg)

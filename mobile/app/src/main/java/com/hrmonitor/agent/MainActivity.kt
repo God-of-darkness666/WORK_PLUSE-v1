@@ -49,7 +49,9 @@ class MainActivity : AppCompatActivity() {
 
         findViewById<Button>(R.id.btnUsage).setOnClickListener {
             startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
-            Toast.makeText(this, "Find HRMonitor in the list and ALLOW usage access", Toast.LENGTH_LONG).show()
+            Toast.makeText(this,
+                "In this list find HRMonitor -> tap it -> turn ON 'Permit usage access', then come back",
+                Toast.LENGTH_LONG).show()
         }
 
         findViewById<Button>(R.id.btnLoc).setOnClickListener {

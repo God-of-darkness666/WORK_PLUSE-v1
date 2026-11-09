@@ -61,40 +61,79 @@ if MONGO_URI:
 if MODE == "memory" and MYSQL_HOST:
     try:
         import pymysql
+        _tls = threading.local()                   # one pooled connection per worker thread
 
         def _conn():
+            """Pooled per-thread connection: reuse instead of a new TLS/TiDB
+            handshake on every call (the #1 cause of slow responses)."""
             kwargs = dict(
                 host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER,
                 password=MYSQL_PASSWORD, charset="utf8mb4",
                 autocommit=True, database=None,
+                connect_timeout=10, read_timeout=60, write_timeout=30,
             )
             if MYSQL_SSL_CA_PATH:                      # strict TLS verification
                 kwargs["ssl"] = {"ca": MYSQL_SSL_CA_PATH}
             else:                                      # TLS required by TiDB, but no CA verify
                 kwargs["ssl"] = {"cert_reqs": _ssl.CERT_NONE}
-            return pymysql.connect(**kwargs)
+            c = getattr(_tls, "conn", None)
+            if c is not None:
+                try:
+                    c.ping(reconnect=True)             # revive silently if dropped
+                    return c
+                except Exception:
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+            _tls.conn = pymysql.connect(**kwargs)
+            return _tls.conn
 
-        def _sql(filename_db=True):
-            """Create db + tables once, return a fresh connection bound to the db."""
-            c = _conn()
-            cur = c.cursor()
-            cur.execute(f"CREATE DATABASE IF NOT EXISTS {MYSQL_DATABASE}")
-            cur.execute(f"USE {MYSQL_DATABASE}")
-            cur.execute("""CREATE TABLE IF NOT EXISTS status_tbl (
-                            identity VARCHAR(150) PRIMARY KEY,
-                            data     TEXT NOT NULL,
-                            last_seen VARCHAR(40))""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS records_tbl (
-                            id INT AUTO_INCREMENT PRIMARY KEY,
-                            identity VARCHAR(150),
-                            day VARCHAR(12),
-                            ts VARCHAR(30),
-                            data TEXT NOT NULL)""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS controls_tbl (
-                            identity VARCHAR(150) PRIMARY KEY,
-                            disabled TINYINT NOT NULL DEFAULT 0)""")
-            c.select_db(MYSQL_DATABASE)
-            return c
+        class _PooledConn:
+            """Wraps the pooled connection so existing call sites can still
+            c.close() - which becomes a safe no-op (the pool stays alive)."""
+            def __init__(self, real):
+                self._real = real
+            def cursor(self):
+                return self._real.cursor()
+            def close(self):
+                pass                                    # pooled: never really close
+
+        _schema_ready = False
+
+        def _sql(schema_db=True):
+            """Return the pooled connection bound to the DB. The schema is
+            ensured ONCE (not on every request) and indexes are added for speed."""
+            global _schema_ready
+            real = _conn()
+            if not _schema_ready:
+                cur = real.cursor()
+                cur.execute(f"CREATE DATABASE IF NOT EXISTS {MYSQL_DATABASE}")
+                cur.execute(f"USE {MYSQL_DATABASE}")
+                cur.execute("""CREATE TABLE IF NOT EXISTS status_tbl (
+                                identity VARCHAR(150) PRIMARY KEY,
+                                data     TEXT NOT NULL,
+                                last_seen VARCHAR(40))""")
+                cur.execute("""CREATE TABLE IF NOT EXISTS records_tbl (
+                                id INT AUTO_INCREMENT PRIMARY KEY,
+                                identity VARCHAR(150),
+                                day VARCHAR(12),
+                                ts VARCHAR(30),
+                                data TEXT NOT NULL)""")
+                cur.execute("""CREATE TABLE IF NOT EXISTS controls_tbl (
+                                identity VARCHAR(150) PRIMARY KEY,
+                                disabled TINYINT NOT NULL DEFAULT 0)""")
+                # speed indexes: day reads + duplicate-proof insert lookups
+                for idx in ("ALTER TABLE records_tbl ADD INDEX idx_ident_day (identity, day)",
+                            "ALTER TABLE records_tbl ADD INDEX idx_ident_ts (identity, ts)",
+                            "ALTER TABLE status_tbl ADD INDEX idx_last_seen (last_seen)"):
+                    try:
+                        cur.execute(idx)
+                    except Exception:
+                        pass                            # index already exists
+                _schema_ready = True
+            real.select_db(MYSQL_DATABASE)
+            return _PooledConn(real)
 
         # warm-up: fail fast on bad credentials when the service starts
         _conn().close()
@@ -149,10 +188,11 @@ if MODE == "memory" and MYSQL_HOST:
         def m_get_records(ident, day):
             c = _sql(); cur = c.cursor()
             if day:
-                cur.execute("SELECT data FROM records_tbl WHERE identity=%s AND day=%s ORDER BY ts",
-                            (ident, day))
+                cur.execute("SELECT data FROM records_tbl WHERE identity=%s AND day=%s "
+                            "ORDER BY ts LIMIT 8000", (ident, day))   # capped: fast responses
             else:
-                cur.execute("SELECT data FROM records_tbl WHERE identity=%s ORDER BY ts", (ident,))
+                cur.execute("SELECT data FROM records_tbl WHERE identity=%s "
+                            "ORDER BY ts LIMIT 8000", (ident,))
             out = []
             for (data,) in cur.fetchall():
                 try:
@@ -378,7 +418,8 @@ def home():
 
 @app.get("/ping")
 def ping():
-    return jsonify({"ok": True, "mode": MODE})
+    """Health check: instant, no database touch (fast for monitors)."""
+    return jsonify({"ok": True, "mode": MODE, "service": "WorkPulse"})
 
 
 @app.post("/upload")
@@ -515,10 +556,23 @@ def w_audit():
 
 @app.after_request
 def no_leak(resp):
-    """Don't advertise server internals."""
+    """Don't advertise server internals + clear request evidence in the log."""
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Server"] = "WorkPulse"
+    try:
+        started = getattr(request, "_wp_start", None)
+        if started:
+            ms = int((time.time() - started) * 1000)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {request.method} "
+                  f"{request.path} -> {resp.status_code} ({ms} ms)", flush=True)
+    except Exception:
+        pass
     return resp
+
+
+@app.before_request
+def mark_start():
+    request._wp_start = time.time()
 
 
 if __name__ == "__main__":

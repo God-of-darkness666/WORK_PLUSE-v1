@@ -154,6 +154,32 @@ def save_config(cfg: dict) -> None:
 
 
 # ----------------------------------------------------------------------------
+# Screenshots on app/tab switch (blueprint: visual evidence, worker-consented)
+# ----------------------------------------------------------------------------
+def screenshots_root(cfg: dict) -> str:
+    """Destination chosen by the admin (Settings) - fallback: local hidden cache."""
+    p = str(cfg.get("screenshots_path", "") or "").strip()
+    return p if p else os.path.join(cache_dir(), "screenshots")
+
+
+def take_screenshot(cfg: dict, app: str, title: str) -> str:
+    """One PNG per switch: <dest>/<day>/<HHMMSS>_<app>.png. Never crashes."""
+    try:
+        from PIL import ImageGrab
+        root = screenshots_root(cfg)
+        day = str(dt.date.today())
+        d = os.path.join(root, IDENTITY.replace("@", "_at_"), day)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"{dt.datetime.now().strftime('%H%M%S')}"
+                               f"_{(''.join(c for c in app if c.isalnum()))[:32]}.png")
+        ImageGrab.grab(all_screens=True).save(path)
+        return path
+    except Exception as e:
+        log_err(f"screenshot error: {e}")
+        return ""
+
+
+# ----------------------------------------------------------------------------
 # Foreground window + process  (pure ctypes, no pywin32 needed)
 # ----------------------------------------------------------------------------
 user32 = ctypes.windll.user32
@@ -548,6 +574,56 @@ def log_restart_event(cloud_url: str):
         pass
 
 
+def install_elevated_tasks():
+    """Runs as ADMIN (self-relaunched with -Verb RunAs). Creates the tasks that
+    cannot be removed/ignored by normal users: minute watchdog + boot autostart."""
+    try:
+        import subprocess
+        exe = sys.executable
+        for args in (
+            ["schtasks", "/Create", "/F", "/TN", "WorkPulseWatchdog",
+             "/SC", "MINUTE", "/MO", "1", "/TR", exe, "/RL", "HIGHEST"],
+            ["schtasks", "/Create", "/F", "/TN", "WorkPulseBoot",
+             "/SC", "ONLOGON", "/DELAY", "0000:30", "/TR", exe, "/RL", "HIGHEST"],
+        ):
+            subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log_err("ELEVATED install done: WorkPulseWatchdog + WorkPulseBoot (RL HIGHEST)")
+    except Exception as e:
+        log_err(f"elevated install error: {e}")
+
+
+def request_full_control() -> None:
+    """First-run interactive: offer the FULL CONTROL install (one UAC prompt).
+    Protects against normal-user bypasses; the watchdog runs with highest rights.
+    NEVER blocks: the question self-skips after 15 s (hidden/started boots)."""
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        import ctypes
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            install_elevated_tasks()          # already admin - create directly
+            return
+        print("  Install with FULL ADMIN control (stronger tamper protection)? [Y/n]"
+              "  (auto-NO in 15 s)", end="", flush=True)
+        import msvcrt
+        buf, start = "", time.time()
+        while time.time() - start < 15:
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch in ("\r", "\n"):
+                    break
+                buf += ch
+        print()
+        if buf.strip().lower() in ("", "y", "yes"):
+            import subprocess
+            subprocess.Popen(["powershell", "-NoProfile", "-Command",
+                              f"Start-Process '{sys.executable}' -ArgumentList "
+                              f"'--install-elevated' -Verb RunAs -WindowStyle Hidden"])
+            log_err("full-control install requested (UAC shown to worker)")
+    except Exception as e:
+        log_err(f"full-control request error: {e}")
+
+
 def ensure_watchdog() -> None:
     """Anti-bypass: a Windows scheduled task restarts the agent every minute.
 
@@ -688,6 +764,9 @@ def step(s: dict) -> None:
         opened_now = (app != s.get("last_open_app"))          # worker switched to a new app
         if opened_now:
             s["last_open_app"] = app
+        tab_changed = bool(tab) and tab != s.get("last_shot_tab")   # switched TAB in browser
+        if tab_changed:
+            s["last_shot_tab"] = tab
         s["current_app"], s["current_title"], s["current_tab"] = app, title, tab
         s["app_secs"][app] = s["app_secs"].get(app, 0) + secs
         if tab:
@@ -719,6 +798,14 @@ def step(s: dict) -> None:
                                       "current_tab": tab, "last_seen": ts_now},
                                   s["cloud_buffer"]):
                         s["cloud_buffer"].clear()
+            # ---- screenshot evidence on app/tab switch (throttled) ----
+            if (opened_now or tab_changed) and time.time() - s.get(
+                    "last_shot", 0) >= max(5, int(s.get("shot_interval", 15))):
+                s["last_shot"] = time.time()
+                shot = take_screenshot(s.get("cfg") or {}, app, title)
+                if shot:
+                    s.setdefault("shot_count", 0)
+                    s["shot_count"] += 1
     elif disabled:
         s["current_app"], s["current_tab"], s["current_title"] = "(disabled by HR)", None, ""
 
@@ -774,6 +861,10 @@ def step(s: dict) -> None:
 # Main loop - never dies: every cycle error is logged and retried
 # ----------------------------------------------------------------------------
 def main() -> None:
+    # ---- special mode: self-install with ADMIN rights (UAC asked once) ----
+    if "--install-elevated" in sys.argv:
+        install_elevated_tasks()
+        return
     # ---- single instance guard: only ONE agent may run -------------------
     ctypes.windll.kernel32.CreateMutexW(None, False, "HRAgentSingleInstanceMutex")
     if ctypes.windll.kernel32.GetLastError() == 183:      # ERROR_ALREADY_EXISTS
@@ -786,6 +877,19 @@ def main() -> None:
     ensure_autostart()
     ensure_watchdog()
     log_restart_event(cfg.get("cloud_url") or "")
+    flag = os.path.join(cache_dir(), "fullcontrol_asked.flag")
+    fresh_ask = not os.path.isfile(flag) and sys.stdin is not None \
+        and hasattr(sys.stdin, "isatty") and sys.stdin.isatty()
+    try:                                          # mark asked BEFORE asking - a
+        with open(flag, "w") as f:                # frozen prompt can never wedge
+            f.write(dt.datetime.now().isoformat(timespec="seconds"))
+    except Exception:
+        pass
+    if fresh_ask:
+        try:
+            request_full_control()
+        except Exception:
+            pass
 
     s = {
         "server": cfg["server_path"],
@@ -811,6 +915,9 @@ def main() -> None:
         "url_last": {},
         "last_open_app": None,
         "last_event_post": 0.0,
+        "last_shot": 0.0,
+        "shot_interval": max(5, int(cfg.get("screenshot_seconds", 15))),
+        "cfg": cfg,
     }
     load_url_state(s)                 # resume browser-history position (no duplicate tabs)
     s["location"], s["ip"] = refresh_location(s["loc"])
@@ -839,6 +946,7 @@ PERMISSION_ITEMS = [
     ("application", "Record which application is on screen (Chrome, Word, games, ...)"),
     ("browser",     "Record the pages opened and searches typed in Chrome / Edge"),
     ("tab",         "Record the current Chrome tab title"),
+    ("screenshot",  "Capture a screenshot when you switch app/tab (timestamped evidence)"),
     ("location",    "Approximate city-level location (based on internet IP, optional)"),
     ("autostart",   "Start automatically after every boot so nothing is missed"),
     ("upload",      "Send the daily records to the company WorkPulse server"),

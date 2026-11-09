@@ -386,6 +386,104 @@ def screen_worker_detail(cfg: dict):
             return
 
 
+def screen_duration(cfg: dict):
+    """Choose one worker -> exactly how LONG each app was used today."""
+    identities = list_identities(cfg)
+    if not identities:
+        console.print("[yellow]No workers have reported yet.[/yellow]")
+        pause(); return
+    console.rule("[bold cyan]DURATION REPORT - per worker")
+    for i, ident in enumerate(identities, 1):
+        console.print(f"   {i}) {ident.replace('@', '  ')[:60]}")
+    ch = console.input("  Select worker # (Enter = 1): ").strip()
+    idx = 0
+    if ch:
+        try:
+            idx = int(ch) - 1
+        except ValueError:
+            return
+    if not (0 <= idx < len(identities)):
+        console.print("bad choice"); pause(); return
+    ident = identities[idx]
+    day = str(dt.date.today())
+    recs = read_day_records(cfg, ident, day)
+    app_secs, tab_secs = aggregate(recs)
+    if not app_secs:
+        console.print(f"[yellow]{ident}: nothing recorded today yet.[/yellow]")
+        pause(); return
+    total = sum(app_secs.values())
+    apps = sorted(app_secs.items(), key=lambda x: -x[1])
+    console.rule(f"[bold cyan]DURATION - {ident} - {day}")
+    console.print(f"  [bold]TOTAL SCREEN TIME TODAY: {hms(total)}[/bold]   "
+                  f"({len(apps)} apps, {len([r for r in recs if r.get('url')])} browser hops)")
+    t = Table(title="TIME PER APPLICATION", box=box.SIMPLE, title_style="bold cyan")
+    t.add_column("#"); t.add_column("Application"); t.add_column("Duration")
+    t.add_column("Share"); t.add_column("Bar")
+    for i, (a, sec) in enumerate(apps, 1):
+        pct = sec * 100.0 / max(1, total)
+        t.add_row(str(i), a[:34], hms(sec), f"{pct:.1f}%",
+                  "#" * max(1, int(pct / 2.5)))
+    console.print(t)
+    top_tab = max(tab_secs.items(), key=lambda x: x[1]) if tab_secs else None
+    if top_tab:
+        console.print(f"  Most-watched browser page: [green]{top_tab[0][:60]}[/green] "
+                      f"({hms(top_tab[1])})")
+    pause()
+
+
+def screen_alerts(cfg: dict):
+    """Protection dashboard: who is offline, who restarted (kill attempts)."""
+    console.rule("[bold red]PROTECTION & ALERTS")
+    if not cfg.get("cloud_url"):
+        console.print("[yellow]Cloud not configured - alerts need cloud mode.[/yellow]")
+        pause(); return
+    try:
+        data = cloud_get(cfg, "/api/status")
+        sts = data.get("status", [])
+    except Exception as e:
+        console.print(f"[red]Cloud not reachable ({type(e).__name__})[/red]")
+        pause(); return
+    now = dt.datetime.now()
+    day = str(dt.date.today())
+    alerts = 0
+    t = Table(title="WORKER PROTECTION STATE (refresh: re-open from menu)",
+              box=box.SIMPLE, title_style="bold red")
+    t.add_column("Worker"); t.add_column("Last seen"); t.add_column("State"); t.add_column("Alerts")
+    for st in sorted(sts, key=lambda s: str(s.get("last_seen", "")), reverse=True):
+        ident = st.get("identity", "?")
+        seen = str(st.get("last_seen", ""))
+        age = ""
+        state = "[green]PROTECTED[/green]"
+        notes = []
+        try:
+            if seen:
+                age_s = (now - dt.datetime.fromisoformat(seen)).total_seconds()
+                age = f"{int(age_s)}s ago"
+                if age_s > 180:
+                    state = "[bold red]ALERT - OFFLINE[/bold red]"
+                    notes.append("agent not reporting (killed/blocked?)")
+                    alerts += 1
+        except Exception:
+            pass
+        try:
+            recs = read_day_records(cfg, ident, day)
+            kills = len([r for r in recs if r.get("kind") == "event"
+                         and r.get("event") == "agent_restarted"])
+            if kills > 1:
+                notes.append(f"{kills - 1}x restarted today (watchdog fights)")
+                if "ALERT" not in state:
+                    state = "[bold yellow]WATCH[/bold yellow]"
+        except Exception:
+            pass
+        t.add_row(ident.replace("@", "  ")[:34], age or seen[:19],
+                  state, "; ".join(notes)[:60] or "-")
+    console.print(t)
+    console.print(f"  Offline alerts right now: [bold red]{alerts}[/bold red]")
+    console.print("[green]Defenses active: watchdog task (auto-restart in <=60s), "
+                  "config tamper-lock, boot task, HTTPS + API key, audit trail.[/green]")
+    pause()
+
+
 def screen_security(cfg: dict):
     """Security Core: view the server-side audit trail."""
     console.rule("[bold cyan]SECURITY & AUDIT TRAIL")
@@ -603,6 +701,21 @@ def screen_export_agent(cfg: dict):
                            "api_key": cfg.get("api_key", ""),
                            "interval_seconds": 10,
                            "heartbeat_seconds": 30, "location_enabled": True}, f, indent=2)
+        # guarantee every kit config carries the admin's screenshot destination
+        dest_cfg_path = os.path.join(dest, "config.json")
+        try:
+            with open(dest_cfg_path, "r", encoding="utf-8") as f:
+                dcfg = json.load(f)
+        except Exception:
+            dcfg = {}
+        dcfg.setdefault("server_path", cfg["data_path"])
+        dcfg.setdefault("cloud_url", cfg.get("cloud_url", ""))
+        dcfg.setdefault("api_key", cfg.get("api_key", ""))
+        if cfg.get("screenshots_path"):
+            dcfg["screenshots_path"] = cfg["screenshots_path"]
+        dcfg.setdefault("screenshot_seconds", 15)
+        with open(dest_cfg_path, "w", encoding="utf-8") as f:
+            json.dump(dcfg, f, indent=2)
         readme = os.path.join(dest, "INSTALL-STEPS.txt")
         with open(readme, "w", encoding="utf-8") as f:
             f.write("HRAgent install steps (employee laptop)\n"
@@ -644,6 +757,7 @@ def screen_settings(cfg: dict):
         console.print("  5) Open records folder in Explorer")
         console.print(f"  6) Cloud settings (Render server)     : [green]{cfg.get('cloud_url') or 'not set'}[/green]")
         console.print(f"  7) Mobile APK path (auto for Export)  : [green]{cfg.get('mobile_apk') or 'auto-detect'}[/green]")
+        console.print(f"  8) Screenshot destination folder      : [green]{cfg.get('screenshots_path') or 'agent default'}[/green]")
         console.print("  B) Back")
         ch = console.input("  Choice: ").strip().lower()
         if ch == "1":
@@ -689,6 +803,12 @@ def screen_settings(cfg: dict):
             cfg["mobile_apk"] = p; save_cfg(cfg)
             if p and not os.path.isfile(p):
                 console.print("[yellow]File not found - Export will keep auto-detecting![/yellow]")
+        elif ch == "8":
+            p = console.input("  Screenshot destination (local folder OR \\\\PC\\share, Enter = agent default): ").strip().strip('"')
+            cfg["screenshots_path"] = p; save_cfg(cfg)
+            console.print(f"[green]Saved. Agents will save captures under: {p or '(agent default = hidden cache)'}\\<worker>\\<day>\\[/green]")
+            console.print("[yellow]Tip: a folder on THIS PC (e.g. C:\\HRScreens) works when agents run locally; "
+                          "for remote workers use a network share or view captures at the worker PC.[/yellow]")
         elif ch == "b":
             return
 
@@ -984,6 +1104,8 @@ def main():
         console.print("  [b]6)[/b] Phone sync        (start/stop server for worker PHONES - Android app)")
         console.print("  [b]7)[/b] [bold]Worker detail[/bold]  (ALL apps used + real links & searches - LIVE)")
         console.print("  [b]8)[/b] Security & audit (server-side trail of admin actions)")
+        console.print("  [b]9)[/b] Duration report  (choose a worker -> exact time per app)")
+        console.print("  [b]A)[/b] [bold red]Protection & alerts[/bold red] (offline / killed / tamper alerts)")
         console.print("  [b]0)[/b] Exit")
         ch = console.input("\n  Choose: ").strip()
         if ch == "1":
@@ -1002,6 +1124,10 @@ def main():
             screen_worker_detail(cfg)
         elif ch == "8":
             screen_security(cfg)
+        elif ch == "9":
+            screen_duration(cfg)
+        elif ch == "a":
+            screen_alerts(cfg)
         elif ch == "0":
             break
 

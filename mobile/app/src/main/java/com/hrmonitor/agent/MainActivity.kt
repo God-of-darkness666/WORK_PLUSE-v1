@@ -62,6 +62,20 @@ class MainActivity : AppCompatActivity() {
             )
         }
 
+        // Anti-kill: exempt from battery optimization so Android cannot force-stop tracking
+        findViewById<Button>(R.id.btnBattery)?.setOnClickListener {
+            try {
+                val i = Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                i.data = android.net.Uri.parse("package:$packageName")
+                startActivity(i)
+                Toast.makeText(this, "Tap ALLOW - tracking then survives battery killing",
+                    Toast.LENGTH_LONG).show()
+            } catch (e: Exception) {
+                Toast.makeText(this, "Open Settings > Battery > Unrestricted for WorkPulse",
+                    Toast.LENGTH_LONG).show()
+            }
+        }
+
         findViewById<Button>(R.id.btnTest).setOnClickListener {
             saveConfig(etName, etServer, etKey)
             testConnection(etServer.text.toString().trim(), etKey.text.toString().trim())

@@ -83,10 +83,10 @@ def save_cfg(cfg: dict) -> None:
 # ----------------------------------------------------------------------------
 # Cloud access (Render server) - used when cloud_url is configured
 # ----------------------------------------------------------------------------
-def cloud_get(cfg: dict, path: str) -> dict:
+def cloud_get(cfg: dict, path: str, timeout: int = 90) -> dict:
     url = cfg["cloud_url"].rstrip("/") + path
     req = urllib.request.Request(url, headers={"X-API-Key": cfg.get("api_key", "")})
-    with urllib.request.urlopen(req, timeout=90) as r:       # patient: cold starts
+    with urllib.request.urlopen(req, timeout=timeout) as r:   # patient: cold starts
         return json.loads(r.read().decode("utf-8"))
 
 
@@ -111,6 +111,86 @@ def log_admin_action(cfg: dict, action: str, target: str = "", result: str = "ok
 
 
 # ----------------------------------------------------------------------------
+# INSTANT admin UI: read-through cache + background cloud sweeper.
+# Screens NEVER wait for the network - they render from cache immediately;
+# the sweeper refreshes quietly every few seconds (patient on cold starts).
+# ----------------------------------------------------------------------------
+_CACHE: dict = {}
+_CACHE_T: dict = {}
+_CACHE_LK = threading.Lock()
+
+
+def _cache_get(key: str):
+    with _CACHE_LK:
+        return _CACHE.get(key), _CACHE_T.get(key, 0.0)
+
+
+def _cache_put(key: str, val):
+    with _CACHE_LK:
+        _CACHE[key] = val
+        _CACHE_T[key] = _time.time()
+
+
+def cached_cloud(key: str, fetch, max_age: float = 5.0):
+    """Instant response: serve cached value immediately; refresh in background
+    when stale. First-ever call uses a FAST probe so the UI is never stuck."""
+    val, ts = _cache_get(key)
+    if val is not None and _time.time() - ts <= max_age:
+        return val                                          # fresh cache -> instant
+    if val is not None:
+        threading.Thread(target=lambda: _sweep_one(key, fetch),
+                         name=f"refresh_{key}", daemon=True).start()
+        return val                                          # stale but instant
+    try:                                                    # cold cache: quick probe
+        val = fetch(timeout=8)
+    except Exception:
+        val = None
+    _cache_put(key, val)
+    return val
+
+
+def _sweep_one(key: str, fetch):
+    try:
+        _cache_put(key, fetch(timeout=90))                  # patient in background
+    except Exception:
+        pass
+
+
+def start_sweeper(cfg: dict):
+    """Background daemon: keeps identity list, worker statuses and today's
+    records warm in the cache so every screen opens instantly."""
+    if not cfg.get("cloud_url"):
+        return
+
+    def loop():
+        while True:
+            try:
+                idents = cloud_get(cfg, "/api/identity_list", timeout=90).get("identities", [])
+                _cache_put("identities", [i for i in idents if i])
+                day = str(dt.date.today())
+                for ident in (idents or [])[:12]:
+                    k = f"st::{ident}"
+                    try:
+                        st = cloud_get(cfg, "/api/status_one?identity="
+                                       + urllib.parse.quote(ident), timeout=90).get("status") or {}
+                        _cache_put(k, st)
+                    except Exception:
+                        pass
+                    kr = f"rec::{ident}::{day}"
+                    try:
+                        recs = cloud_get(cfg, f"/api/records?identity={urllib.parse.quote(ident)}"
+                                         f"&day={day}", timeout=90).get("records", [])
+                        _cache_put(kr, recs)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            _time.sleep(6)
+
+    threading.Thread(target=loop, name="cloud_sweeper", daemon=True).start()
+
+
+# ----------------------------------------------------------------------------
 # Data reading (local shared folder AND/OR cloud - both are merged)
 # ----------------------------------------------------------------------------
 def list_identities(cfg: dict) -> list:
@@ -121,12 +201,11 @@ def list_identities(cfg: dict) -> list:
             if os.path.isdir(os.path.join(users_dir, name)) and "@" in name:
                 out.add(name)
     if cfg.get("cloud_url"):
-        try:
-            for ident in cloud_get(cfg, "/api/identity_list").get("identities", []):
-                if ident:
-                    out.add(ident)
-        except Exception:
-            console.print("[dim yellow](cloud not reachable now)[/dim yellow]")
+        def _fetch(timeout=90):
+            return [i for i in cloud_get(cfg, "/api/identity_list", timeout)
+                    .get("identities", []) if i]
+        for ident in (cached_cloud("identities", _fetch) or []):
+            out.add(ident)
     return sorted(out)
 
 
@@ -138,10 +217,12 @@ def read_status(cfg: dict, identity: str) -> dict:
     except Exception:
         pass
     if cfg.get("cloud_url"):
-        try:
-            return cloud_get(cfg, "/api/status_one?identity=" + urllib.parse.quote(identity)).get("status") or {}
-        except Exception:
-            pass
+        def _fetch(timeout=90):
+            return cloud_get(cfg, "/api/status_one?identity=" + urllib.parse.quote(identity),
+                             timeout).get("status") or {}
+        st = cached_cloud(f"st::{identity}", _fetch)
+        if st:
+            return st
     return {}
 
 
@@ -157,10 +238,10 @@ def read_day_records(cfg: dict, identity: str, day: str) -> list:
     except Exception:
         pass
     if not recs and cfg.get("cloud_url"):
-        try:
-            recs = cloud_get(cfg, f"/api/records?identity={urllib.parse.quote(identity)}&day={day}").get("records", [])
-        except Exception:
-            pass
+        def _fetch(timeout=90):
+            return cloud_get(cfg, f"/api/records?identity={urllib.parse.quote(identity)}"
+                             f"&day={day}", timeout).get("records", [])
+        recs = cached_cloud(f"rec::{identity}::{day}", _fetch) or []
     return recs
 
 
@@ -1090,6 +1171,7 @@ def main():
     cfg = load_cfg()
     set_title()
     banner_reveal()
+    start_sweeper(cfg)                          # cloud stays warm -> instant screens
     while True:
         console.clear()
         console.print(Panel(BANNER, border_style="cyan"))

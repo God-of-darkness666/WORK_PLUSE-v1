@@ -9,10 +9,20 @@
         android:layout_height="wrap_content"
         android:orientation="vertical">
 
+        <ImageView
+            android:layout_width="230dp"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginTop="8dp"
+            android:layout_marginBottom="12dp"
+            android:adjustViewBounds="true"
+            android:contentDescription="WorkPulse logo"
+            android:src="@drawable/workpulse_logo"/>
+
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="HRMonitor Mobile"
+            android:text="WorkPulse Mobile"
             android:textSize="22sp"
             android:textStyle="bold"/>
 

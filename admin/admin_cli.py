@@ -937,12 +937,39 @@ BANNER = r"""
   \ \ /\ / /| |/ _` | | '_ \ / _` |/ _ \ '__| | |_) | | | | |/ / __|
    \ V  V / | | (_| | | |_) | (_| |  __/ |    |  __/| |_| |   <|\__ \
     \_/\_/  |_|\__,_| |_.__/ \__,_|\___|_|    |_|    \__,_|_|\_\___/
-       AI Workforce Intelligence & Security  -  Monitor. Understand. Govern.
+       AI Workforce Intelligence & Security   -   MONITOR  •  SECURE  •  EMPOWER
 """
+
+
+def set_title():
+    """Windows taskbar/terminal title = brand, always visible."""
+    try:
+        os.system("title WORKPLUSE - AI Workforce Intelligence & Security")
+    except Exception:
+        pass
+
+
+def banner_reveal():
+    """Little boot animation: the WORKPLUSE wordmark types itself in (fast)."""
+    from rich.text import Text
+    text = BANNER.strip("\n")
+    step = max(4, len(text) // 26)
+    for k in range(0, len(text) + step, step):
+        console.clear()
+        console.print(Text(text[:k] + "\u258c", style="bold cyan"))
+        _time.sleep(0.02)
+    console.clear()
+    console.print(Panel(BANNER, border_style="cyan"))
+    console.print(Text("   WORKPLUSE  \u2014  AI Workforce Intelligence & Security   "
+                       "\u2022   MONITOR \u2022 SECURE \u2022 EMPOWER",
+                       style="bold #7dd3fc"))
+    _time.sleep(0.4)
 
 
 def main():
     cfg = load_cfg()
+    set_title()
+    banner_reveal()
     while True:
         console.clear()
         console.print(Panel(BANNER, border_style="cyan"))

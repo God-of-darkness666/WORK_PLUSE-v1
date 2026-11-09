@@ -408,24 +408,29 @@ def server_reachable(server: str) -> bool:
 # Cloud mode (Render server) - wins over the shared folder when cloud_url set
 # ----------------------------------------------------------------------------
 def post_cloud(s: dict, status: dict, records: list) -> bool:
-    try:
-        url = s["cloud_url"].rstrip("/") + "/upload"
-        body = json.dumps({"identity": IDENTITY, "status": status, "records": records}).encode("utf-8")
-        req = urllib.request.Request(
-            url, data=body,
-            headers={"Content-Type": "application/json", "X-API-Key": s["api_key"]})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            return r.status == 200
-    except Exception as e:
-        log_err(f"cloud upload error ({s['cloud_url']}): {e}")
-        return False
+    """Patient upload: free-tier Render may sleep -> waking takes up to ~90 s.
+    The records stay in cloud_buffer on failure and are retried next cycle."""
+    for attempt in (1, 2):
+        try:
+            url = s["cloud_url"].rstrip("/") + "/upload"
+            body = json.dumps({"identity": IDENTITY, "status": status, "records": records}).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=body,
+                headers={"Content-Type": "application/json", "X-API-Key": s["api_key"]})
+            with urllib.request.urlopen(req, timeout=90) as r:
+                return r.status == 200
+        except Exception as e:
+            log_err(f"cloud upload error ({s['cloud_url']}): {e}")
+            if attempt == 1:
+                time.sleep(10)               # give a waking server one more chance
+    return False
 
 
 def cloud_disabled(s: dict) -> bool:
     try:
         url = s["cloud_url"].rstrip("/") + "/api/is_disabled?identity=" + urllib.parse.quote(IDENTITY)
         req = urllib.request.Request(url, headers={"X-API-Key": s["api_key"]})
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=90) as r:   # patient: cold starts
             return bool(json.loads(r.read().decode("utf-8")).get("disabled"))
     except Exception:
         return False
@@ -792,7 +797,7 @@ def step(s: dict) -> None:
             append_record(os.path.join(cache_dir(), "users", IDENTITY, "day.jsonl"), event)
             if s["cloud_url"]:
                 s["cloud_buffer"].append(event)
-                if time.time() - s.get("last_event_post", 0) >= 2:   # INSTANT live feed
+                if time.time() - s.get("last_event_post", 0) >= 10:  # INSTANT live feed
                     s["last_event_post"] = time.time()
                     if post_cloud(s, {"current_app": app, "current_title": title,
                                       "current_tab": tab, "last_seen": ts_now},

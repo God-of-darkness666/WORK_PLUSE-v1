@@ -86,7 +86,7 @@ def save_cfg(cfg: dict) -> None:
 def cloud_get(cfg: dict, path: str) -> dict:
     url = cfg["cloud_url"].rstrip("/") + path
     req = urllib.request.Request(url, headers={"X-API-Key": cfg.get("api_key", "")})
-    with urllib.request.urlopen(req, timeout=15) as r:
+    with urllib.request.urlopen(req, timeout=90) as r:       # patient: cold starts
         return json.loads(r.read().decode("utf-8"))
 
 
@@ -96,7 +96,7 @@ def cloud_post(cfg: dict, path: str, obj: dict) -> dict:
     req = urllib.request.Request(url, data=body, method="POST",
                                  headers={"Content-Type": "application/json",
                                           "X-API-Key": cfg.get("api_key", "")})
-    with urllib.request.urlopen(req, timeout=15) as r:
+    with urllib.request.urlopen(req, timeout=90) as r:       # patient: cold starts
         return json.loads(r.read().decode("utf-8"))
 
 

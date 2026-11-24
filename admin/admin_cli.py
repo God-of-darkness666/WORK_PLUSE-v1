@@ -17,10 +17,12 @@ import os
 import shutil
 import sys
 import datetime as dt
+import getpass
 import http.server
 import socket
 import threading
 import urllib.request
+import urllib.error
 import urllib.parse
 import time as _time
 import msvcrt          # windows keyboard poll (this GUI is Windows-only)
@@ -83,14 +85,198 @@ def save_cfg(cfg: dict) -> None:
 # ----------------------------------------------------------------------------
 # Cloud access (Render server) - used when cloud_url is configured
 # ----------------------------------------------------------------------------
-def cloud_get(cfg: dict, path: str, timeout: int = 90) -> dict:
+# ----------------------------------------------------------------------------
+# V3 sign-in: JWT access token + rotating refresh token, stored per Windows user
+# ----------------------------------------------------------------------------
+SESSION_PATH = os.path.join(_app_dir(), "admin_session.json")
+_LEGACY_GET = {
+    "/api/identity_list": "/api/v1/admin/identities",
+    "/api/status": "/api/v1/admin/status",
+    "/api/status_one": "/api/v1/admin/status_one",
+    "/api/records": "/api/v1/admin/activity",
+    "/api/audit": "/api/v1/admin/audit",
+}
+
+
+def load_session() -> dict:
+    try:
+        if os.path.exists(SESSION_PATH):
+            with open(SESSION_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def save_session(sess: dict) -> None:
+    try:
+        with open(SESSION_PATH, "w", encoding="utf-8") as f:
+            json.dump(sess, f, indent=2)
+        try:
+            os.chmod(SESSION_PATH, 0o600)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def clear_session() -> None:
+    try:
+        if os.path.exists(SESSION_PATH):
+            os.remove(SESSION_PATH)
+    except Exception:
+        pass
+
+
+def _raw_request(cfg: dict, method: str, path: str, obj=None,
+                 headers=None, timeout: int = 90):
     url = cfg["cloud_url"].rstrip("/") + path
-    req = urllib.request.Request(url, headers={"X-API-Key": cfg.get("api_key", "")})
+    h = {"X-API-Key": cfg.get("api_key", "")}
+    h.update(headers or {})
+    data = None
+    if obj is not None:
+        data = json.dumps(obj).encode("utf-8")
+        h["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+            return r.status, (json.loads(raw) if raw else {})
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            body = {}
+        return e.code, body
+    except Exception as e:
+        raise RuntimeError(f"server unreachable: {e}")
+
+
+def _store_login(cfg: dict, body: dict) -> dict:
+    admin = body.get("admin") or {}
+    tenant = body.get("tenant") or {}
+    sess = {
+        "access_token": body.get("access_token", ""),
+        "refresh_token": body.get("refresh_token", ""),
+        "expires_at": _time.time() + int(body.get("expires_in") or 1800),
+        "email": admin.get("email", ""),
+        "role": admin.get("role", ""),
+        "tenant_id": tenant.get("id"),
+        "tenant_name": tenant.get("name", ""),
+        "saved_at": dt.datetime.now().isoformat(timespec="seconds"),
+    }
+    save_session(sess)
+    return sess
+
+
+def api_login(cfg: dict, email: str, password: str) -> tuple:
+    return _raw_request(cfg, "POST", "/api/v1/auth/login",
+                        {"email": email, "password": password})
+
+
+def api_bootstrap(cfg: dict, org: str, email: str, password: str) -> tuple:
+    return _raw_request(cfg, "POST", "/api/v1/auth/bootstrap",
+                        {"org_name": org, "email": email, "password": password},
+                        {"X-Bootstrap-Key": cfg.get("api_key", "")})
+
+
+def ensure_access(cfg: dict, force: bool = False) -> bool:
+    """True when a usable access token is available (refreshes transparently)."""
+    if not cfg.get("cloud_url"):
+        return False
+    sess = load_session()
+    if not sess.get("refresh_token"):
+        return False
+    if (not force and sess.get("access_token")
+            and float(sess.get("expires_at") or 0) > _time.time() + 60):
+        return True
+    try:
+        status, body = _raw_request(cfg, "POST", "/api/v1/auth/refresh",
+                                    {"refresh_token": sess["refresh_token"]})
+    except Exception:
+        return False
+    if status == 200 and body.get("access_token"):
+        _store_login(cfg, body)
+        return True
+    clear_session()
+    return False
+
+
+def signed_in(cfg: dict) -> bool:
+    return bool(cfg.get("cloud_url") and load_session().get("refresh_token"))
+
+
+def api_request(cfg: dict, method: str, path: str, obj=None,
+                timeout: int = 90, retry: bool = True):
+    """Tenant-scoped call with automatic token refresh on expiry/401."""
+    ensure_access(cfg)
+    sess = load_session()
+    headers = {}
+    if sess.get("access_token"):
+        headers["Authorization"] = "Bearer " + sess["access_token"]
+    status, body = _raw_request(cfg, method, path, obj, headers, timeout)
+    if status == 401 and retry and sess.get("refresh_token"):
+        if ensure_access(cfg, force=True):
+            return api_request(cfg, method, path, obj, timeout, retry=False)
+    return status, body
+
+
+def _v1_get_path(path: str) -> str:
+    base, sep, qs = path.partition("?")
+    target = _LEGACY_GET.get(base)
+    if not target:
+        return path
+    return target + (("?" + qs) if qs else "")
+
+
+def cloud_get(cfg: dict, path: str, timeout: int = 90) -> dict:
+    """Read from the cloud. Tenant-scoped v1 routes are used when signed in;
+    otherwise the legacy pilot-tenant endpoints keep the panel working."""
+    if signed_in(cfg):
+        status, body = api_request(cfg, "GET", _v1_get_path(path), timeout=timeout)
+        if status == 200:
+            if "entries" in body:          # normalise v1 audit -> legacy shape
+                for e in body["entries"]:
+                    e.setdefault("admin", e.get("actor", ""))
+            return body
+        if status in (401, 403):
+            raise RuntimeError(body.get("error", {}).get("message")
+                               if isinstance(body.get("error"), dict)
+                               else "not signed in")
+    req = urllib.request.Request(
+        cfg["cloud_url"].rstrip("/") + path,
+        headers={"X-API-Key": cfg.get("api_key", "")})
     with urllib.request.urlopen(req, timeout=timeout) as r:   # patient: cold starts
         return json.loads(r.read().decode("utf-8"))
 
 
 def cloud_post(cfg: dict, path: str, obj: dict) -> dict:
+    if signed_in(cfg):
+        if path.startswith("/api/disable"):
+            ident = urllib.parse.quote(str(obj.get("identity", "")), safe="")
+            if ident:
+                status, body = api_request(
+                    cfg, "POST", f"/api/v1/admin/identities/{ident}/disable",
+                    {"disabled": bool(obj.get("disabled"))})
+                if status == 200:
+                    return body
+                msg = body.get("error", {})
+                raise RuntimeError(msg.get("message") if isinstance(msg, dict)
+                                   else f"HTTP {status}")
+        if path == "/api/audit":
+            status, body = api_request(cfg, "POST", "/api/v1/admin/audit", obj)
+            if status == 200:
+                return body
+            return body
+        if path.startswith("/api/") and not path.startswith(("/api/v1/", "/upload")):
+            status, body = api_request(cfg, "POST", path, obj)
+            if status in (200, 201):
+                return body
+            msg = body.get("error", {})
+            raise RuntimeError(msg.get("message") if isinstance(msg, dict)
+                               else f"HTTP {status}")
     url = cfg["cloud_url"].rstrip("/") + path
     body = json.dumps(obj).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST",
@@ -1142,6 +1328,265 @@ BANNER = r"""
 """
 
 
+def _server_probe(cfg: dict, path: str, timeout: int = 120):
+    """Unauthenticated GET used by the sign-in screen (cold starts tolerated)."""
+    url = cfg["cloud_url"].rstrip("/") + path
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def screen_login(cfg: dict) -> bool:
+    console.clear()
+    console.print(Panel("[bold cyan]WORKPLUSE[/bold cyan]  -  sign in to your company",
+                        border_style="cyan"))
+    if not cfg.get("cloud_url"):
+        console.print("  [yellow]No cloud server configured.[/yellow] "
+                      "Open Settings (4) and set the server URL first.")
+        pause()
+        return False
+    console.print(f"  Server : [green]{cfg['cloud_url']}[/green]")
+    console.print("  [dim]First start may take ~30 s while the free server wakes up.[/dim]\n")
+    try:
+        info = _server_probe(cfg, "/api/v1/auth/status")
+    except Exception as e:
+        console.print(f"  [red]Server unreachable:[/red] {e}")
+        pause()
+        return False
+    initialized = bool(info.get("initialized"))
+    console.print(f"  Version : {info.get('version')}   "
+                  f"{'Workspace ready' if initialized else 'No admin yet'}\n")
+
+    try:
+        if not initialized:
+            console.print("  [bold]Create the first administrator[/bold] "
+                          "(one time only)\n")
+            org = console.input("  Organization name: ").strip() or "WorkPulse HQ"
+            email = console.input("  Admin email: ").strip()
+            while True:
+                pw = getpass.getpass("  Choose a password (min 10 chars): ")
+                if len(pw) < 10:
+                    console.print("  [red]Too short - at least 10 characters.[/red]")
+                    continue
+                if getpass.getpass("  Repeat password: ") != pw:
+                    console.print("  [red]Passwords do not match.[/red]")
+                    continue
+                break
+            status, body = api_bootstrap(cfg, org, email, pw)
+            if status not in (200, 201):
+                msg = body.get("error", {})
+                console.print(f"  [red]Setup failed:[/red] "
+                              f"{msg.get('message') if isinstance(msg, dict) else body}")
+                pause()
+                return False
+            console.print("  [green]Workspace created.[/green] Signing in...")
+
+        for attempt in range(1, 4):
+            email = console.input("  Email: ").strip()
+            pw = getpass.getpass("  Password: ")
+            status, body = api_login(cfg, email, pw)
+            if status == 200:
+                sess = _store_login(cfg, body)
+                console.print(f"\n  [green]Signed in[/green] as {sess['email']} "
+                              f"({sess.get('role')})")
+                console.print(f"  Tenant : {sess.get('tenant_name')} "
+                              f"(id {sess.get('tenant_id')})")
+                _time.sleep(1.2)
+                return True
+            msg = body.get("error", {})
+            text = msg.get("message") if isinstance(msg, dict) else str(body)
+            console.print(f"  [red]Login failed:[/red] {text or status}")
+    except KeyboardInterrupt:
+        return False
+    pause()
+    return False
+
+
+def screen_account(cfg: dict) -> None:
+    while True:
+        console.clear()
+        sess = load_session()
+        console.print(Panel("[bold cyan]WORKPLUSE[/bold cyan]  -  account",
+                            border_style="cyan"))
+        if signed_in(cfg) and sess:
+            console.print(f"  Signed in : [green]{sess.get('email')}[/green] "
+                          f"({sess.get('role')})")
+            console.print(f"  Tenant    : {sess.get('tenant_name')} "
+                          f"(id {sess.get('tenant_id')})")
+            console.print(f"  Server    : {cfg.get('cloud_url')}")
+            try:
+                st, lic = api_request(cfg, "GET", "/api/v1/admin/license")
+                if st == 200:
+                    console.print(f"  Licence   : plan={lic.get('plan')} "
+                                  f"status={lic.get('status')} seats={lic.get('seats')}")
+            except Exception:
+                pass
+            console.print("\n  [b]1)[/b] Change password   [b]2)[/b] Sign out   "
+                          "[b]0)[/b] Back")
+            ch = console.input("\n  Choose: ").strip()
+            if ch == "1":
+                old = getpass.getpass("  Current password: ")
+                new = getpass.getpass("  New password (min 10): ")
+                confirm = getpass.getpass("  Repeat new password: ")
+                if new != confirm or len(new) < 10:
+                    console.print("  [red]Passwords must match and be 10+ characters.[/red]")
+                    pause(); continue
+                st, body = api_request(cfg, "POST", "/api/v1/auth/change-password",
+                                       {"old_password": old, "new_password": new})
+                if st == 200:
+                    console.print("  [green]Password changed.[/green] Sign in again.")
+                    clear_session()
+                    pause(); return
+                msg = body.get("error", {})
+                console.print(f"  [red]{msg.get('message') if isinstance(msg, dict) else body}[/red]")
+                pause()
+            elif ch == "2":
+                if console.input("  Sign out now? [y/N]: ").strip().lower() == "y":
+                    try:
+                        api_request(cfg, "POST", "/api/v1/auth/logout",
+                                    {"refresh_token": sess.get("refresh_token", "")})
+                    except Exception:
+                        pass
+                    clear_session()
+                    console.print("  [green]Signed out.[/green]")
+                    pause(); return
+            else:
+                return
+        else:
+            console.print("  Not signed in. The panel is using the legacy pilot "
+                          "endpoint.\n")
+            ch = console.input("  [b]1)[/b] Sign in   [b]0)[/b] Back\n\n  Choose: ").strip()
+            if ch == "1":
+                screen_login(cfg)
+            else:
+                return
+
+
+def _need_login(cfg: dict) -> bool:
+    if signed_in(cfg) and ensure_access(cfg):
+        return True
+    console.print("  [yellow]Please sign in first.[/yellow]")
+    pause()
+    return screen_login(cfg)
+
+
+def screen_employees(cfg: dict) -> None:
+    """Employees, devices, enrollment codes and revocation - real tenant data."""
+    if not _need_login(cfg):
+        return
+    while True:
+        console.clear()
+        console.print(Panel("[bold cyan]WORKPLUSE[/bold cyan]  -  people & devices",
+                            border_style="cyan"))
+        try:
+            st_emp, emps = api_request(cfg, "GET", "/api/v1/admin/employees")
+            st_dev, devs = api_request(cfg, "GET", "/api/v1/admin/devices")
+        except Exception as e:
+            console.print(f"  [red]Server unreachable:[/red] {e}")
+            pause(); return
+        if st_emp != 200 or st_dev != 200:
+            console.print("  [red]Could not load tenant data.[/red]")
+            pause(); return
+
+        table = Table(title="Employees", box=box.SIMPLE, header_style="bold cyan")
+        table.add_column("ID", justify="right")
+        table.add_column("Name")
+        table.add_column("Email")
+        table.add_column("Department")
+        table.add_column("Status")
+        for e in emps.get("employees", []):
+            table.add_row(str(e["id"]), e.get("name") or "",
+                          e.get("email") or "-", e.get("department") or "-",
+                          e.get("status") or "")
+        console.print(table if emps.get("employees") else "  No employees yet.")
+
+        dtable = Table(title="Devices", box=box.SIMPLE, header_style="bold cyan")
+        dtable.add_column("ID", justify="right")
+        dtable.add_column("Device")
+        dtable.add_column("Identity")
+        dtable.add_column("Employee")
+        dtable.add_column("OS")
+        dtable.add_column("Last seen")
+        dtable.add_column("Status")
+        for d in devs.get("devices", []):
+            dtable.add_row(str(d["id"]), d.get("name") or d.get("device_uid") or "",
+                           d.get("identity") or "", d.get("employee") or "-",
+                           d.get("os") or "-", str(d.get("last_seen") or "-"),
+                           d.get("status") or "")
+        console.print(dtable if devs.get("devices") else "  No devices enrolled yet.")
+
+        console.print("\n  [b]1)[/b] Add employee   [b]2)[/b] New enrollment code   "
+                      "[b]3)[/b] Revoke device   [b]0)[/b] Back")
+        ch = console.input("\n  Choose: ").strip()
+        if ch == "1":
+            name = console.input("  Full name: ").strip()
+            email = console.input("  Email (optional): ").strip()
+            dept = console.input("  Department (optional): ").strip()
+            status, body = api_request(cfg, "POST", "/api/v1/admin/employees",
+                                       {"name": name, "email": email,
+                                        "department": dept})
+            if status == 201:
+                console.print(f"  [green]Employee #{body['employee']['id']} added.[/green]")
+            else:
+                msg = body.get("error", {})
+                console.print(f"  [red]{msg.get('message') if isinstance(msg, dict) else body}[/red]")
+            pause()
+        elif ch == "2":
+            emp_id = console.input("  Employee ID (blank = unassigned device): ").strip()
+            payload = {"expires_minutes": 15}
+            if emp_id.isdigit():
+                payload["employee_id"] = int(emp_id)
+            status, body = api_request(cfg, "POST", "/api/v1/admin/enrollment-codes",
+                                       payload)
+            if status == 201:
+                console.print(f"\n  [bold green]Enrollment code: "
+                              f"{body['code']}[/bold green]")
+                console.print(f"  Valid for {body['expires_in_seconds'] // 60} minutes "
+                              "and can be used once.")
+                console.print("\n  On the worker's laptop run:")
+                console.print(f"    [bold]HRAgent.exe --enroll {body['code']}[/bold]")
+                console.print("  [dim]The laptop then receives its own device token; "
+                              "no shared key is needed.[/dim]")
+            else:
+                msg = body.get("error", {})
+                console.print(f"  [red]{msg.get('message') if isinstance(msg, dict) else body}[/red]")
+            pause()
+        elif ch == "3":
+            dev_id = console.input("  Device ID to revoke: ").strip()
+            if dev_id.isdigit() and console.input(
+                    "  Revoke this device immediately? [y/N]: ").strip().lower() == "y":
+                status, body = api_request(
+                    cfg, "POST", f"/api/v1/admin/devices/{int(dev_id)}/revoke")
+                if status == 200:
+                    console.print(f"  [green]Device {dev_id} revoked.[/green] "
+                                  "Its agent can no longer upload.")
+                else:
+                    msg = body.get("error", {})
+                    console.print(f"  [red]{msg.get('message') if isinstance(msg, dict) else body}[/red]")
+                pause()
+        else:
+            return
+
+
+def startup_auth(cfg: dict) -> None:
+    if not cfg.get("cloud_url"):
+        return
+    if signed_in(cfg):
+        if ensure_access(cfg):
+            sess = load_session()
+            console.print(f"  [green]Signed in[/green] as {sess.get('email')} "
+                          f"- {sess.get('tenant_name')}")
+            return
+        clear_session()
+    console.print("  [yellow]You are not signed in[/yellow] - the panel will use "
+                  "the legacy pilot endpoint.")
+    try:
+        ch = console.input("  Sign in now? [Y/n]: ").strip().lower()
+    except Exception:
+        ch = "n"
+    if ch in ("", "y", "yes"):
+        screen_login(cfg)
+
+
 def set_title():
     """Windows taskbar/terminal title = brand, always visible."""
     try:
@@ -1171,13 +1616,18 @@ def main():
     cfg = load_cfg()
     set_title()
     banner_reveal()
+    startup_auth(cfg)                           # V3 sign-in (tenant scoped screens)
     start_sweeper(cfg)                          # cloud stays warm -> instant screens
     while True:
         console.clear()
         console.print(Panel(BANNER, border_style="cyan"))
+        sess = load_session() if signed_in(cfg) else {}
+        account = (f"{sess.get('email')}  ({sess.get('tenant_name')})"
+                   if sess else "not signed in  (legacy pilot endpoint)")
         console.print(f"  Records folder : [green]{cfg['data_path']}[/green]    "
                       f"Backup folder : [green]{cfg['backup_path']}[/green]\n"
-                      f"  Cloud          : [green]{cfg.get('cloud_url') or 'not set (local/share mode)'}[/green]\n")
+                      f"  Cloud          : [green]{cfg.get('cloud_url') or 'not set (local/share mode)'}[/green]\n"
+                      f"  Account        : [green]{account}[/green]\n")
         console.print("  [b]1)[/b] Dashboard        (who is using what - live)")
         console.print("  [b]2)[/b] User management  (user, laptop, active status)")
         console.print("  [b]3)[/b] Export agent EXE (downloadable employee EXE kit)")
@@ -1188,6 +1638,8 @@ def main():
         console.print("  [b]8)[/b] Security & audit (server-side trail of admin actions)")
         console.print("  [b]9)[/b] Duration report  (choose a worker -> exact time per app)")
         console.print("  [b]A)[/b] [bold red]Protection & alerts[/bold red] (offline / killed / tamper alerts)")
+        console.print("  [b]E)[/b] [bold]Employees & devices[/bold] (add people, enrollment codes, revoke)")
+        console.print("  [b]L)[/b] Account          (sign in / sign out / password)")
         console.print("  [b]0)[/b] Exit")
         ch = console.input("\n  Choose: ").strip()
         if ch == "1":
@@ -1210,6 +1662,10 @@ def main():
             screen_duration(cfg)
         elif ch == "a":
             screen_alerts(cfg)
+        elif ch == "e":
+            screen_employees(cfg)
+        elif ch == "l":
+            screen_account(cfg)
         elif ch == "0":
             break
 

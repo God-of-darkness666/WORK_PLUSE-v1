@@ -30,10 +30,12 @@ import ctypes.wintypes
 import getpass
 import json
 import os
+import re
 import socket
 import sys
 import time
 import urllib.request
+import urllib.error
 import urllib.parse
 import shutil
 import traceback
@@ -46,6 +48,7 @@ from fpdf.enums import XPos, YPos
 # ----------------------------------------------------------------------------
 # Constants / paths
 # ----------------------------------------------------------------------------
+AGENT_VERSION = "3.0.0"
 HEARTBEAT_ACTIVE_WINDOW = 180        # admin marks user "Active" if last_seen < 180 s
 CHROME_SUFFIX = " - Google Chrome"
 FRIENDLY_NAMES = {
@@ -140,8 +143,14 @@ def load_config() -> dict:
         if not str(cfg.get("api_key", "") or "").strip() and BUILD_LOCK["api_key"]:
             cfg["api_key"] = BUILD_LOCK["api_key"]
             tampered = True
-        if tampered:
-            log_err("config.json was deleted/edited -> reverted to BUILT-IN locked settings")
+    # enrollment survives config.json deletion/editing
+    dev = load_device_state()
+    if dev.get("device_token") and not str(cfg.get("device_token") or "").strip():
+        cfg["device_token"] = dev["device_token"]
+        cfg["device_id"] = dev.get("device_id")
+        cfg["device_identity"] = dev.get("identity", "")
+    if tampered:
+        log_err("config.json was deleted/edited -> reverted to BUILT-IN locked settings")
     return cfg
 
 
@@ -151,6 +160,108 @@ def save_config(cfg: dict) -> None:
             json.dump(cfg, f, indent=2)
     except Exception:
         pass
+
+
+# ----------------------------------------------------------------------------
+# V3 enrollment: one-time code -> per-device token (no shared key inside the EXE)
+# ----------------------------------------------------------------------------
+def device_uid() -> str:
+    raw = f"{getpass.getuser()}-{socket.gethostname()}"
+    return re.sub(r"[^A-Za-z0-9_.-]", "", raw)[:120] or "device"
+
+
+def _device_state_path() -> str:
+    """Second copy of the device token, outside the deploy folder.
+
+    Deleting/editing config.json must never unenroll the laptop, so the token
+    is mirrored to %APPDATA%\\HRAgent\\device.json and restored on startup.
+    """
+    return os.path.join(cache_dir(), "device.json")
+
+
+def load_device_state() -> dict:
+    state = {}
+    try:
+        if os.path.exists(_device_state_path()):
+            with open(_device_state_path(), "r", encoding="utf-8") as f:
+                state = json.load(f) or {}
+    except Exception as e:
+        log_err(f"device state read error: {e}")
+    if not isinstance(state, dict) or not state.get("device_token"):
+        try:                                     # fall back to config.json
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    cfg = json.load(f) or {}
+                if cfg.get("device_token"):
+                    state = {"device_token": cfg["device_token"],
+                             "device_id": cfg.get("device_id"),
+                             "identity": cfg.get("device_identity", "")}
+        except Exception:
+            pass
+    return state if isinstance(state, dict) else {}
+
+
+def save_device_state(state: dict) -> None:
+    try:
+        os.makedirs(cache_dir(), exist_ok=True)
+        with open(_device_state_path(), "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        log_err(f"device state save error: {e}")
+
+
+def enroll_device(code: str, cloud_url: str = "") -> dict:
+    """Redeem an 8-character enrollment code for a per-device token."""
+    import platform
+    code = re.sub(r"[^A-Za-z0-9]", "", str(code or "")).upper()
+    if len(code) != 8:
+        raise ValueError("enrollment code must be 8 letters/digits")
+    cfg = load_config()
+    cloud = (cloud_url or str(cfg.get("cloud_url") or "").strip()
+             or BUILD_LOCK.get("cloud_url", "")).strip()
+    if not cloud:
+        raise ValueError("no cloud server configured")
+    payload = {
+        "code": code,
+        "device_uid": device_uid(),
+        "name": socket.gethostname(),
+        "os": f"Windows {platform.release()}".strip(),
+        "model": (platform.processor() or platform.machine() or "")[:120],
+        "version": AGENT_VERSION,
+        # keeps existing history when upgrading a laptop that already reported
+        "identity": IDENTITY,
+    }
+    req = urllib.request.Request(
+        cloud.rstrip("/") + "/api/v1/devices/enroll",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r:
+            body = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read().decode("utf-8"))
+            msg = (detail.get("error") or {}).get("message") or str(detail)
+        except Exception:
+            msg = f"server returned HTTP {e.code}"
+        raise ValueError(msg)
+    token = str(body.get("device_token") or "")
+    if not token:
+        raise ValueError("server did not return a device token")
+    state = {"device_token": token,
+             "device_id": body.get("device_id"),
+             "identity": str(body.get("identity") or ""),
+             "device_uid": device_uid(),
+             "cloud_url": cloud,
+             "enrolled_at": dt.datetime.now().isoformat(timespec="seconds")}
+    save_device_state(state)
+    cfg.update({"cloud_url": cloud.rstrip("/") + "/",
+                "device_token": token,
+                "device_id": body.get("device_id"),
+                "device_identity": state["identity"]})
+    save_config(cfg)
+    log_err(f"enrolled as {state['identity']} (device {body.get('device_id')})")
+    return state
 
 
 # ----------------------------------------------------------------------------
@@ -407,18 +518,43 @@ def server_reachable(server: str) -> bool:
 # ----------------------------------------------------------------------------
 # Cloud mode (Render server) - wins over the shared folder when cloud_url set
 # ----------------------------------------------------------------------------
+def cloud_headers(s: dict) -> dict:
+    token = str(s.get("device_token") or "").strip()
+    if token:                                     # v3: per-device credential
+        return {"Content-Type": "application/json", "X-Device-Token": token}
+    return {"Content-Type": "application/json", "X-API-Key": s["api_key"]}
+
+
 def post_cloud(s: dict, status: dict, records: list) -> bool:
     """Patient upload: free-tier Render may sleep -> waking takes up to ~90 s.
-    The records stay in cloud_buffer on failure and are retried next cycle."""
+    The records stay in cloud_buffer on failure and are retried next cycle.
+
+    Enrolled agents (v3) use /api/v1/agent/activity with a per-device token;
+    older installs keep working through the legacy /upload endpoint.
+    """
     for attempt in (1, 2):
         try:
-            url = s["cloud_url"].rstrip("/") + "/upload"
-            body = json.dumps({"identity": IDENTITY, "status": status, "records": records}).encode("utf-8")
-            req = urllib.request.Request(
-                url, data=body,
-                headers={"Content-Type": "application/json", "X-API-Key": s["api_key"]})
+            path = "/api/v1/agent/activity" if s.get("device_token") else "/upload"
+            url = s["cloud_url"].rstrip("/") + path
+            body = json.dumps({"identity": IDENTITY, "status": status,
+                               "records": records, "version": AGENT_VERSION,
+                               "queue_depth": len(records)}).encode("utf-8")
+            req = urllib.request.Request(url, data=body, headers=cloud_headers(s))
             with urllib.request.urlopen(req, timeout=90) as r:
+                try:
+                    reply = json.loads(r.read().decode("utf-8"))
+                    if isinstance(reply, dict) and "disabled" in reply:
+                        s["disabled"] = bool(reply.get("disabled"))
+                except Exception:
+                    pass
                 return r.status == 200
+        except urllib.error.HTTPError as e:
+            log_err(f"cloud upload error ({s['cloud_url']}): HTTP {e.code}")
+            if e.code in (401, 403):
+                s["auth_failed"] = True              # revoked / bad token -> stop spamming
+                return False
+            if attempt == 1:
+                time.sleep(10)               # give a waking server one more chance
         except Exception as e:
             log_err(f"cloud upload error ({s['cloud_url']}): {e}")
             if attempt == 1:
@@ -427,13 +563,22 @@ def post_cloud(s: dict, status: dict, records: list) -> bool:
 
 
 def cloud_disabled(s: dict) -> bool:
+    token = str(s.get("device_token") or "").strip()
     try:
-        url = s["cloud_url"].rstrip("/") + "/api/is_disabled?identity=" + urllib.parse.quote(IDENTITY)
-        req = urllib.request.Request(url, headers={"X-API-Key": s["api_key"]})
+        if token:
+            url = s["cloud_url"].rstrip("/") + "/api/v1/agent/state"
+            req = urllib.request.Request(url, headers={"X-Device-Token": token})
+        else:
+            url = (s["cloud_url"].rstrip("/") + "/api/is_disabled?identity="
+                   + urllib.parse.quote(IDENTITY))
+            req = urllib.request.Request(url, headers={"X-API-Key": s["api_key"]})
         with urllib.request.urlopen(req, timeout=90) as r:   # patient: cold starts
-            return bool(json.loads(r.read().decode("utf-8")).get("disabled"))
+            reply = json.loads(r.read().decode("utf-8"))
+        val = bool(reply.get("disabled"))
+        s["disabled"] = val
+        return val
     except Exception:
-        return False
+        return bool(s.get("disabled"))
 
 
 def sync_pending(server: str, cache_root: str) -> None:
@@ -943,6 +1088,38 @@ def main() -> None:
     if "--install-elevated" in sys.argv:
         install_elevated_tasks()
         return
+    # ---- V3 enrollment: HRAgent.exe --enroll ABC12345 ---------------------
+    if "--enroll" in sys.argv:
+        idx = sys.argv.index("--enroll")
+        code = sys.argv[idx + 1].strip() if len(sys.argv) > idx + 1 else ""
+        if not code:
+            try:
+                code = input("Enrollment code (8 characters): ").strip()
+            except Exception:
+                code = ""
+        try:
+            state = enroll_device(code)
+        except Exception as e:
+            print(f"Enrollment failed: {e}")
+            log_err(f"enrollment failed: {e}")
+            sys.exit(1)
+        print(f"Enrolled successfully.")
+        print(f"  Identity : {state.get('identity')}")
+        print(f"  Device   : {state.get('device_id')}")
+        print(f"  Server   : {state.get('cloud_url')}")
+        return
+    if "--status" in sys.argv or "--whoami" in sys.argv:
+        cfg = load_config()
+        dev = load_device_state()
+        print(f"HRAgent {AGENT_VERSION}")
+        print(f"  Cloud   : {cfg.get('cloud_url') or '(not set)'}")
+        if dev.get("device_token"):
+            print(f"  Enrolled: yes -> {dev.get('identity')} "
+                  f"(device {dev.get('device_id')})")
+        else:
+            print("  Enrolled: no (using legacy API key)")
+            print("  Run: HRAgent.exe --enroll <8-character-code>")
+        return
     # ---- single instance guard: only ONE agent may run -------------------
     ctypes.windll.kernel32.CreateMutexW(None, False, "HRAgentSingleInstanceMutex")
     if ctypes.windll.kernel32.GetLastError() == 183:      # ERROR_ALREADY_EXISTS
@@ -973,6 +1150,9 @@ def main() -> None:
         "server": cfg["server_path"],
         "cloud_url": str(cfg.get("cloud_url", "") or "").strip(),
         "api_key": str(cfg.get("api_key", "") or "").strip(),
+        "device_token": str(cfg.get("device_token", "") or "").strip(),
+        "device_identity": str(cfg.get("device_identity", "") or ""),
+        "disabled": False,
         "cloud_buffer": [],
         "interval": max(1, int(cfg.get("interval_seconds", 10))),
         "heartbeat": max(5, int(cfg.get("heartbeat_seconds", 30))),
@@ -1002,7 +1182,9 @@ def main() -> None:
     s["last_loc"] = time.time()
     if s["cloud_url"]:
         s["online"] = True
-        log_err(f"CLOUD mode -> {s['cloud_url']} (shared folder not used)")
+        mode = ("enrolled device token" if s["device_token"]
+                else "legacy API key - run --enroll to upgrade")
+        log_err(f"CLOUD mode -> {s['cloud_url']} ({mode})")
     else:
         s["online"] = server_reachable(s["server"])
         log_err(f"config ok, server_path={s['server']}, online={s['online']}")

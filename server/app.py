@@ -1301,6 +1301,42 @@ def v1_activity():
                                            g.admin["tenant_id"])})
 
 
+@app.get("/api/v1/admin/status")
+@mysql_required
+@admin_required
+def v1_status_all():
+    return jsonify({"status": list_status(g.admin["tenant_id"])})
+
+
+@app.get("/api/v1/admin/status_one")
+@mysql_required
+@admin_required
+def v1_status_one():
+    identity = str(request.args.get("identity") or "").strip()
+    if not identity:
+        return json_err("invalid_identity", "identity is required", 400)
+    return jsonify({"status": get_status(identity, g.admin["tenant_id"])})
+
+
+@app.post("/api/v1/admin/identities/<path:identity>/disable")
+@mysql_required
+@admin_required
+def v1_identity_disable(identity: str):
+    """Per-worker kill switch. Scoped to the caller's tenant only."""
+    identity = identity.strip()[:150]
+    if not identity:
+        return json_err("invalid_identity", "identity is required", 400)
+    body = request.get_json(silent=True) or {}
+    flag = bool(body.get("disabled", True))
+    tid = g.admin["tenant_id"]
+    known = identity in set(list_identities(tid))
+    if not known:
+        return json_err("not_found", "identity not found in this tenant", 404)
+    set_disabled(identity, flag, tid)
+    audit("user.disabled" if flag else "user.enabled", identity, "ok")
+    return jsonify({"ok": True, "identity": identity, "disabled": flag})
+
+
 @app.get("/api/v1/admin/audit")
 @mysql_required
 @admin_required
@@ -1314,6 +1350,19 @@ def v1_audit():
             for r in cur.fetchall()]
     c.close()
     return jsonify({"entries": rows, "count": len(rows)})
+
+
+@app.post("/api/v1/admin/audit")
+@mysql_required
+@admin_required
+def v1_audit_write():
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return json_err("invalid_structure", "invalid JSON body", 400)
+    rec = audit(str(body.get("action", "admin.action"))[:64],
+                str(body.get("target", ""))[:150],
+                str(body.get("result", "ok"))[:255])
+    return jsonify({"ok": True, "logged": rec})
 
 
 @app.get("/api/v1/admin/license")
@@ -1362,6 +1411,22 @@ def v1_enroll():
     if not identity:
         safe_uid = re.sub(r"[^A-Za-z0-9_.-]", "", device_uid)[:60] or "device"
         identity = f"device.{safe_uid}@workpulse"
+    # Pilot continuity: an agent already reporting under a legacy identity
+    # (user@machine) may keep it, but only when that identity belongs to this
+    # tenant, exists in real history, and is not owned by another live device.
+    preferred = str(body.get("identity") or "").strip()[:150]
+    claimed = ""
+    if (not employee_id and preferred and IDENT_RE.match(preferred)
+            and preferred != identity):
+        cur.execute("SELECT COUNT(*) FROM devices WHERE tenant_id=%s AND identity=%s "
+                    "AND status='active'", (tid, preferred))
+        owned = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM status_v2 WHERE tenant_id=%s AND identity=%s",
+                    (tid, preferred))
+        in_history = cur.fetchone()[0]
+        if not owned and in_history:
+            claimed = identity
+            identity = preferred
     identity = identity[:150]
     name = str(body.get("name") or "").strip()[:150] or device_uid
     os_name = str(body.get("os") or "").strip()[:60]
@@ -1393,6 +1458,9 @@ def v1_enroll():
     c.close()
     audit("device.enrolled", f"{device_id}:{device_uid}", "ok", tenant_id=tid,
           actor_type="device", actor_id=device_uid)
+    if claimed:
+        audit("identity.claimed", f"{claimed} -> {identity}", "ok", tenant_id=tid,
+              actor_type="device", actor_id=device_uid)
     return jsonify({"ok": True, "device_id": device_id, "identity": identity,
                     "device_token": token,
                     "server_time": now_iso()}), 201
@@ -1417,6 +1485,11 @@ def v1_agent_activity():
     recs = recs[:MAX_RECORDS_PER_UPLOAD]
     tenant_id = g.device["tenant_id"]
     identity = g.device["identity"]
+    disabled = get_disabled(identity, tenant_id)
+    if disabled:
+        # kill switch is server-side too: a tampered agent cannot keep reporting
+        return jsonify({"received": 0, "identity": identity, "disabled": True,
+                        "server_time": now_iso()})
     received = save_records(identity, recs, tenant_id)
     old = get_status(identity, tenant_id) or {}
     merged = {**old, **st}
@@ -1449,12 +1522,17 @@ def v1_agent_heartbeat():
         "identity": g.device["identity"]}
     st["last_seen"] = now_iso()
     st["queue_depth"] = int(body.get("queue_depth") or 0)
+    if body.get("current_app") is not None:
+        st["current_app"] = str(body.get("current_app"))[:120]
     upsert_status(g.device["identity"], st, tenant_id)
     return jsonify({"ok": True, "server_time": now_iso(),
-                    "config": v1_agent_config_payload(tenant_id)})
+                    "identity": g.device["identity"],
+                    "disabled": get_disabled(g.device["identity"], tenant_id),
+                    "config": v1_agent_config_payload(tenant_id,
+                                                      g.device["identity"])})
 
 
-def v1_agent_config_payload(tenant_id: int) -> dict:
+def v1_agent_config_payload(tenant_id: int, identity: str = "") -> dict:
     tenant = _tenant_row(tenant_id) or {}
     cfg = {}
     try:
@@ -1465,15 +1543,29 @@ def v1_agent_config_payload(tenant_id: int) -> dict:
     cfg.setdefault("retention_days", 90)
     cfg.setdefault("heartbeat_seconds", 60)
     cfg.setdefault("screenshots", None)      # null = agent keeps its local setting
+    if identity:
+        cfg["disabled"] = get_disabled(identity, tenant_id)
     cfg["server_time"] = now_iso()
     return cfg
+
+
+@app.get("/api/v1/agent/state")
+@mysql_required
+@device_required
+def v1_agent_state():
+    """Tiny poll used by the agent every cycle: is this worker disabled?"""
+    tid = g.device["tenant_id"]
+    return jsonify({"ok": True, "identity": g.device["identity"],
+                    "disabled": get_disabled(g.device["identity"], tid),
+                    "server_time": now_iso()})
 
 
 @app.get("/api/v1/agent/config")
 @mysql_required
 @device_required
 def v1_agent_config():
-    return jsonify(v1_agent_config_payload(g.device["tenant_id"]))
+    return jsonify(v1_agent_config_payload(g.device["tenant_id"],
+                                           g.device["identity"]))
 
 
 @app.get("/api/v1/agent/release")

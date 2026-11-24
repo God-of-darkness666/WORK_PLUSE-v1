@@ -440,8 +440,16 @@ if MODE == "memory":
 
 
 # ------------------------------------------------------------------ shared storage API
+TZ_OFFSET_MINUTES = int(os.environ.get("TZ_OFFSET_MINUTES", "330"))   # IST
+
+
+def now_dt():
+    """Business clock = tenant timezone (default IST) regardless of host UTC."""
+    return datetime.utcnow() + timedelta(minutes=TZ_OFFSET_MINUTES)
+
+
 def now_iso():
-    return datetime.now().isoformat(timespec="seconds")
+    return now_dt().isoformat(timespec="seconds")
 
 
 if MODE == "mongo":
@@ -902,7 +910,7 @@ def device_required(fn):
 
 
 def _future_iso(seconds: int) -> str:
-    return (datetime.now() + timedelta(seconds=seconds)).isoformat(timespec="seconds")
+    return (now_dt() + timedelta(seconds=seconds)).isoformat(timespec="seconds")
 
 
 def _tenant_row(tenant_id: int):
@@ -1112,7 +1120,7 @@ def v1_change_password():
 @admin_required
 def v1_dashboard():
     tid = g.admin["tenant_id"]
-    cutoff = (datetime.now() - timedelta(minutes=5)).isoformat(timespec="seconds")
+    cutoff = (now_dt() - timedelta(minutes=5)).isoformat(timespec="seconds")
     c = _sql(); cur = c.cursor()
     cur.execute("SELECT COUNT(*) FROM employees WHERE tenant_id=%s AND status='active'",
                 (tid,))
@@ -1591,7 +1599,7 @@ def no_leak(resp):
         started = getattr(request, "_wp_start", None)
         if started:
             ms = int((time.time() - started) * 1000)
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] {request.method} "
+            print(f"[{now_dt().strftime('%H:%M:%S')}] {request.method} "
                   f"{request.path} -> {resp.status_code} ({ms} ms)", flush=True)
     except Exception:
         pass

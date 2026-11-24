@@ -101,9 +101,11 @@ DEFAULT_CONFIG = {
 # Anti-bypass: these are locked INSIDE the EXE at build time. If a worker
 # deletes / empties / edits config.json (remove server & key -> "go invisible"),
 # the agent silently reverts to these -> tampering cannot break monitoring.
+# V3: the EXE carries ONLY the server URL. Each laptop gets its own device
+# token from a one-time enrollment code, so no shared key can be extracted.
 BUILD_LOCK = {
     "cloud_url": "https://work-pluse-v1.onrender.com/",
-    "api_key": "hr-secret-2026-naveen",
+    "api_key": "",
 }
 
 IDENTITY = f"{getpass.getuser()}@{socket.gethostname()}"

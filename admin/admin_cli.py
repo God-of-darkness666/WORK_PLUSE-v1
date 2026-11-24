@@ -954,30 +954,16 @@ def screen_export_agent(cfg: dict):
         ok = robust_copy(agent_exe, os.path.join(dest, "HRAgent.exe"), "HRAgent.exe")
         if not ok:
             pause(); return
-        # also copy a pre-filled config so the employee needs zero setup
-        src_cfg = os.path.join(os.path.dirname(agent_exe), "config.json")
-        agent_src_cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agent", "config.json")
-        if os.path.isfile(src_cfg):
-            robust_copy(src_cfg, os.path.join(dest, "config.json"), "config.json")
-        elif os.path.isfile(agent_src_cfg):
-            robust_copy(agent_src_cfg, os.path.join(dest, "config.json"), "config.json")
-        else:
-            with open(os.path.join(dest, "config.json"), "w") as f:
-                json.dump({"server_path": cfg["data_path"],
-                           "cloud_url": cfg.get("cloud_url", ""),
-                           "api_key": cfg.get("api_key", ""),
-                           "interval_seconds": 10,
-                           "heartbeat_seconds": 30, "location_enabled": True}, f, indent=2)
-        # guarantee every kit config carries the admin's screenshot destination
+        # V3 kit: NO shared API key and NO copied config. Each laptop enrolls
+        # with its own one-time code, so a leaked kit cannot report as anyone.
         dest_cfg_path = os.path.join(dest, "config.json")
-        try:
-            with open(dest_cfg_path, "r", encoding="utf-8") as f:
-                dcfg = json.load(f)
-        except Exception:
-            dcfg = {}
-        dcfg.setdefault("server_path", cfg["data_path"])
-        dcfg.setdefault("cloud_url", cfg.get("cloud_url", ""))
-        dcfg.setdefault("api_key", cfg.get("api_key", ""))
+        dcfg = {
+            "server_path": cfg["data_path"],
+            "cloud_url": cfg.get("cloud_url", ""),
+            "interval_seconds": 10,
+            "heartbeat_seconds": 30,
+            "location_enabled": True,
+        }
         if cfg.get("screenshots_path"):
             dcfg["screenshots_path"] = cfg["screenshots_path"]
         dcfg.setdefault("screenshot_seconds", 15)
@@ -988,11 +974,14 @@ def screen_export_agent(cfg: dict):
             f.write("HRAgent install steps (employee laptop)\n"
                     "=======================================\n"
                     "1. Copy HRAgent.exe and config.json into the same folder.\n"
-                    "2. config.json already points to the HR server - do not edit it.\n"
-                    "3. Double-click HRAgent.exe once.\n"
-                    "4. On the consent screen type ACCEPT to allow monitoring\n"
-                    "   (run HRAgent.exe --permissions anytime to inspect what it sees).\n"
-                    "That's all.\n")
+                    "2. In the HR panel: Employees & devices -> New enrollment code.\n"
+                    "3. Open a command prompt in this folder and run:\n"
+                    "       HRAgent.exe --enroll <THE-8-CHARACTER-CODE>\n"
+                    "   This gives THIS laptop its own private device token.\n"
+                    "4. Start HRAgent.exe (it will ask for consent once - type ACCEPT).\n"
+                    "5. Check anytime with:  HRAgent.exe --status\n"
+                    "   and inspect visibility with:  HRAgent.exe --permissions\n"
+                    "The kit contains NO shared password, so it is safe to hand out.\n")
 
         # ---------- phone side (APK) ----------
         apk_src = find_mobile_apk(cfg)

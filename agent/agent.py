@@ -579,20 +579,98 @@ def log_restart_event(cloud_url: str):
         pass
 
 
+def _register_task(name: str, exe: str, run_level: str = "LeastPrivilege",
+                   trigger: str = "minute") -> bool:
+    """Register a scheduled task from XML. This is the ONLY reliable way when the
+    EXE path contains spaces (e.g. 'C:\\Users\\X\\Desktop\\WORKPLUSE USER'):
+    schtasks /TR splits the path at the first space and the task then fails with
+    'file not found'. XML keeps <Command> and <WorkingDirectory> separate.
+
+    Also disables the laptop battery restrictions that silently stop tasks.
+    """
+    try:
+        import subprocess
+        import tempfile
+        from xml.sax.saxutils import escape as _xesc
+
+        start = dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        if trigger == "minute":
+            trig = (f"<TimeTrigger><StartBoundary>{start}</StartBoundary>"
+                    "<Repetition><Interval>PT1M</Interval></Repetition>"
+                    "</TimeTrigger>")
+        else:                                   # logon / boot autostart
+            trig = ("<LogonTrigger><Enabled>true</Enabled>"
+                    "<Delay>PT30S</Delay></LogonTrigger>")
+
+        xml = f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>WorkPulse protection task</Description>
+  </RegistrationInfo>
+  <Triggers>{trig}</Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>{run_level}</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{_xesc(exe)}</Command>
+      <WorkingDirectory>{_xesc(os.path.dirname(exe))}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>"""
+
+        fd, path = tempfile.mkstemp(prefix="wp_task_", suffix=".xml")
+        os.close(fd)
+        try:
+            with open(path, "w", encoding="utf-16") as f:
+                f.write(xml)
+            r = subprocess.run(["schtasks", "/Create", "/F", "/TN", name,
+                                "/XML", path],
+                               capture_output=True, text=True)
+            return r.returncode == 0
+        finally:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+    except Exception as e:
+        log_err(f"task {name} registration error: {e}")
+        return False
+
+
 def install_elevated_tasks():
     """Runs as ADMIN (self-relaunched with -Verb RunAs). Creates the tasks that
     cannot be removed/ignored by normal users: minute watchdog + boot autostart."""
     try:
-        import subprocess
         exe = sys.executable
-        for args in (
-            ["schtasks", "/Create", "/F", "/TN", "WorkPulseWatchdog",
-             "/SC", "MINUTE", "/MO", "1", "/TR", exe, "/RL", "HIGHEST"],
-            ["schtasks", "/Create", "/F", "/TN", "WorkPulseBoot",
-             "/SC", "ONLOGON", "/DELAY", "0000:30", "/TR", exe, "/RL", "HIGHEST"],
-        ):
-            subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        log_err("ELEVATED install done: WorkPulseWatchdog + WorkPulseBoot (RL HIGHEST)")
+        ok_watch = _register_task("WorkPulseWatchdog", exe, "HighestAvailable",
+                                  "minute")
+        ok_boot = _register_task("WorkPulseBoot", exe, "HighestAvailable",
+                                 "logon")
+        log_err(f"ELEVATED install done: watchdog={ok_watch} boot={ok_boot} "
+                f"(RL HIGHEST)")
     except Exception as e:
         log_err(f"elevated install error: {e}")
 
@@ -639,16 +717,11 @@ def ensure_watchdog() -> None:
     if not getattr(sys, "frozen", False):
         return
     try:
-        import subprocess
         exe = sys.executable
-        # launch the EXE DIRECTLY (cmd /c wrappers fail inside Task Scheduler);
-        # the agent's single-instance mutex makes any extra launch self-terminate
-        subprocess.run(["schtasks", "/Create", "/F", "/TN", "WorkPulseWatchdog",
-                        "/SC", "MINUTE", "/MO", "1", "/TR", exe],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        chk = subprocess.run(["schtasks", "/Query", "/TN", "WorkPulseWatchdog"],
-                             capture_output=True, text=True).stdout
-        if "WorkPulseWatchdog" in chk:
+        # XML registration: survives spaces in the folder name, and does not
+        # stop on battery (the old /TR approach silently created a broken task).
+        ok = _register_task("WorkPulseWatchdog", exe, "LeastPrivilege", "minute")
+        if ok:
             log_err("watchdog armed: WorkPulseWatchdog task restarts the agent "
                     "within 60s if it is killed")
         else:

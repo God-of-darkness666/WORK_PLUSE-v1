@@ -70,7 +70,7 @@ def load_cfg() -> dict:
     cfg = dict(DEFAULT_CONFIG)
     try:
         if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
                 cfg.update(json.load(f))
     except Exception:
         pass
@@ -1317,7 +1317,104 @@ BANNER = r"""
 """
 
 
-def _server_probe(cfg: dict, path: str, timeout: int = 120):
+def screen_billing(cfg: dict) -> None:
+    """Plan, seats, renewal and Razorpay payment - real tenant subscription."""
+    if not _need_login(cfg):
+        return
+    while True:
+        console.clear()
+        console.print(Panel("[bold cyan]WORKPLUSE[/bold cyan]  -  subscription & plan",
+                            border_style="cyan"))
+        try:
+            st, lic = api_request(cfg, "GET", "/api/v1/admin/license")
+            st_plans, plans = api_request(cfg, "GET", "/api/v1/plans")
+        except Exception as e:
+            console.print(f"  [red]Server unreachable:[/red] {e}")
+            pause(); return
+        if st != 200:
+            console.print("  [red]Could not load the licence.[/red]")
+            pause(); return
+
+        seats = lic.get("seats")
+        seats_txt = "unlimited" if seats is None else f"{lic.get('seats_used')}/{seats}"
+        feats = lic.get("features") or {}
+        console.print(f"  Plan        : [bold]{lic.get('plan_name')}[/bold] "
+                      f"({lic.get('plan')})   status={lic.get('status')}")
+        console.print(f"  Seats       : {seats_txt} used   "
+                      f"cycle={lic.get('billing_cycle')}")
+        console.print(f"  Amount      : INR {lic.get('amount_inr')}   "
+                      f"renews/expires: {lic.get('expires_at') or '-'}"
+                      + (f"   ({lic.get('days_left')} days left)"
+                         if lic.get("days_left") is not None else ""))
+        console.print(f"  Screenshots : "
+                      f"{'ENABLED' if feats.get('screenshots_enabled') else 'off'}"
+                      f"   (entitled={bool(feats.get('screenshots_entitled'))})")
+        console.print(f"  Tenant      : {lic.get('tenant')} "
+                      f"[{lic.get('tenant_status')}]")
+
+        if st_plans == 200:
+            t = Table(title="Plans (INR)", box=box.SIMPLE, header_style="bold cyan")
+            t.add_column("ID"); t.add_column("Name"); t.add_column("Seats")
+            t.add_column("Price"); t.add_column("Billing"); t.add_column("Shots")
+            for p in plans.get("plans", []):
+                if p.get("per_seat"):
+                    price = f"{p['price_per_seat']}/seat"
+                else:
+                    price = str(p.get("price_inr"))
+                t.add_row(p["id"], p["name"],
+                          f"{p['min_seats']}-{p['max_seats']}", price,
+                          p["billing"], "yes" if p["screenshots"] else "no")
+            console.print(t)
+
+        console.print("\n  [b]1)[/b] Change plan / renew   [b]2)[/b] Screenshots on/off   "
+                      "[b]0)[/b] Back")
+        ch = console.input("\n  Choose: ").strip()
+        if ch == "1":
+            plan = console.input("  Plan id (starter/business/custom/enterprise): ").strip().lower()
+            seats_in = console.input("  Seats: ").strip()
+            cycle = console.input("  Billing cycle [monthly/annual] (Enter = plan default): ").strip().lower()
+            payload = {"plan": plan}
+            if seats_in.isdigit():
+                payload["seats"] = int(seats_in)
+            if cycle:
+                payload["billing_cycle"] = cycle
+            st2, body = api_request(cfg, "POST", "/api/v1/admin/subscription/request",
+                                    payload)
+            if st2 in (200, 201):
+                amount = body.get("amount_inr")
+                pay = body.get("payment") or {}
+                console.print(f"\n  [green]Request recorded.[/green] Amount: INR {amount}")
+                if pay.get("short_url"):
+                    console.print(f"  [bold]Pay here:[/bold] {pay['short_url']}")
+                    console.print("  [dim]The plan activates automatically after payment "
+                                  "(Razorpay webhook).[/dim]")
+                else:
+                    console.print(f"  [yellow]{pay.get('instructions') or 'Payment provider not configured.'}[/yellow]")
+                    console.print(f"  Reference: {pay.get('reference')}")
+                console.print("  The current plan stays active until payment is confirmed.")
+            else:
+                msg = body.get("error", {})
+                console.print(f"  [red]{msg.get('message') if isinstance(msg, dict) else body}[/red]")
+            pause()
+        elif ch == "2":
+            if not (lic.get("features") or {}).get("screenshots_entitled"):
+                console.print("  [yellow]Screenshots are an Enterprise feature. "
+                              "Change plan first.[/yellow]")
+                pause(); continue
+            turn_on = console.input("  Enable screenshots? [y/N]: ").strip().lower() in ("y", "yes")
+            st2, body = api_request(cfg, "POST", "/api/v1/admin/settings/screenshots",
+                                    {"enabled": turn_on})
+            if st2 == 200:
+                console.print(f"  [green]Screenshots {'enabled' if turn_on else 'disabled'}.[/green]")
+            else:
+                msg = body.get("error", {})
+                console.print(f"  [red]{msg.get('message') if isinstance(msg, dict) else body}[/red]")
+            pause()
+        else:
+            return
+
+
+
     """Unauthenticated GET used by the sign-in screen (cold starts tolerated)."""
     url = cfg["cloud_url"].rstrip("/") + path
     with urllib.request.urlopen(url, timeout=timeout) as r:
@@ -1405,8 +1502,17 @@ def screen_account(cfg: dict) -> None:
             try:
                 st, lic = api_request(cfg, "GET", "/api/v1/admin/license")
                 if st == 200:
-                    console.print(f"  Licence   : plan={lic.get('plan')} "
-                                  f"status={lic.get('status')} seats={lic.get('seats')}")
+                    seats = lic.get("seats")
+                    seats_txt = ("unlimited" if seats is None
+                                 else f"{lic.get('seats_used')}/{seats}")
+                    days = lic.get("days_left")
+                    console.print(f"  Licence   : {lic.get('plan_name')} "
+                                  f"({lic.get('plan')})  status={lic.get('status')}")
+                    console.print(f"  Seats     : {seats_txt} used   "
+                                  f"expires: {lic.get('expires_at') or '-'}"
+                                  + (f"  ({days} days left)" if days is not None else ""))
+                    console.print(f"  Screenshots: "
+                                  f"{'ENABLED' if (lic.get('features') or {}).get('screenshots_enabled') else 'off'}")
             except Exception:
                 pass
             console.print("\n  [b]1)[/b] Change password   [b]2)[/b] Sign out   "
@@ -1628,6 +1734,7 @@ def main():
         console.print("  [b]9)[/b] Duration report  (choose a worker -> exact time per app)")
         console.print("  [b]A)[/b] [bold red]Protection & alerts[/bold red] (offline / killed / tamper alerts)")
         console.print("  [b]E)[/b] [bold]Employees & devices[/bold] (add people, enrollment codes, revoke)")
+        console.print("  [b]B)[/b] [bold]Subscription[/bold]     (plan, seats, renew, screenshots)")
         console.print("  [b]L)[/b] Account          (sign in / sign out / password)")
         console.print("  [b]0)[/b] Exit")
         ch = console.input("\n  Choose: ").strip()
@@ -1653,6 +1760,8 @@ def main():
             screen_alerts(cfg)
         elif ch == "e":
             screen_employees(cfg)
+        elif ch == "b":
+            screen_billing(cfg)
         elif ch == "l":
             screen_account(cfg)
         elif ch == "0":

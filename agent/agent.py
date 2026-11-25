@@ -92,10 +92,11 @@ CONFIG_PATH = os.path.join(app_dir(), "config.json")
 DEFAULT_CONFIG = {
     "server_path": r"\\ADMIN-PC\HRData",   # <-- shared-folder mode (HR edits before deploying)
     "cloud_url": "",                       # <-- CLOUD mode (Render server), e.g. https://hr-xxx.onrender.com
-    "api_key": "",                         # <-- secret API key (must match the server's HR_API_KEY)
+    "api_key": "",                         # <-- legacy shared key (enrolled agents use a device token)
     "interval_seconds": 10,                # sample every 10 s
     "heartbeat_seconds": 30,               # status update every 30 s
     "location_enabled": True,              # IP based city-level location
+    "screenshots_enabled": True,           # local emergency switch; the server plan decides
 }
 
 # Anti-bypass: these are locked INSIDE the EXE at build time. If a worker
@@ -131,7 +132,7 @@ def load_config() -> dict:
     tampered = False
     try:
         if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
                 cfg.update(json.load(f))
         else:
             save_config(cfg)                     # create default config next to EXE
@@ -564,7 +565,12 @@ def post_cloud(s: dict, status: dict, records: list) -> bool:
     return False
 
 
-def cloud_disabled(s: dict) -> bool:
+def cloud_state(s: dict) -> dict:
+    """Server-side switches: kill switch + screenshot entitlement.
+
+    Returns {"disabled": bool, "screenshots": bool|None}. On any network error
+    the last known values are reused so a sleeping server does not flip policy.
+    """
     token = str(s.get("device_token") or "").strip()
     try:
         if token:
@@ -576,11 +582,20 @@ def cloud_disabled(s: dict) -> bool:
             req = urllib.request.Request(url, headers={"X-API-Key": s["api_key"]})
         with urllib.request.urlopen(req, timeout=90) as r:   # patient: cold starts
             reply = json.loads(r.read().decode("utf-8"))
-        val = bool(reply.get("disabled"))
-        s["disabled"] = val
-        return val
+        out = {"disabled": bool(reply.get("disabled"))}
+        if "screenshots" in reply:
+            out["screenshots"] = bool(reply.get("screenshots"))
+        s["disabled"] = out["disabled"]
+        if "screenshots" in out:
+            s["screenshots_allowed"] = out["screenshots"]
+        return out
     except Exception:
-        return bool(s.get("disabled"))
+        return {"disabled": bool(s.get("disabled")),
+                "screenshots": s.get("screenshots_allowed")}
+
+
+def cloud_disabled(s: dict) -> bool:
+    return bool(cloud_state(s).get("disabled"))
 
 
 def sync_pending(server: str, cache_root: str) -> None:
@@ -973,11 +988,13 @@ def step(s: dict) -> None:
         s["app_secs"], s["tab_secs"] = {}, {}
         s["today"] = day
 
-    # ---- respect the HR disable switch ----------------------------------
+    # ---- respect the HR disable switch + server screenshot policy ---------
     if s["cloud_url"]:
-        disabled = cloud_disabled(s)
+        state = cloud_state(s)
+        disabled = bool(state.get("disabled"))
     else:
         disabled = os.path.exists(os.path.join(s["server"], "control", f"{IDENTITY}.disabled"))
+        s["screenshots_allowed"] = bool(s.get("screenshots_enabled", True))
 
     # ---- sample foreground application ----------------------------------
     fg = get_foreground()
@@ -1023,9 +1040,12 @@ def step(s: dict) -> None:
                                       "current_tab": tab, "last_seen": ts_now},
                                   s["cloud_buffer"]):
                         s["cloud_buffer"].clear()
-            # ---- screenshot evidence on app/tab switch (throttled) ----
-            if (opened_now or tab_changed) and time.time() - s.get(
-                    "last_shot", 0) >= max(5, int(s.get("shot_interval", 15))):
+            # ---- screenshot evidence on app/tab switch (Enterprise opt-in) ----
+            if ((opened_now or tab_changed)
+                    and s.get("screenshots_allowed")
+                    and s.get("screenshots_enabled", True)
+                    and time.time() - s.get("last_shot", 0) >= max(
+                        5, int(s.get("shot_interval", 15)))):
                 s["last_shot"] = time.time()
                 shot = take_screenshot(s.get("cfg") or {}, app, title)
                 if shot:
@@ -1155,6 +1175,8 @@ def main() -> None:
         "device_token": str(cfg.get("device_token", "") or "").strip(),
         "device_identity": str(cfg.get("device_identity", "") or ""),
         "disabled": False,
+        "screenshots_allowed": False,
+        "screenshots_enabled": bool(cfg.get("screenshots_enabled", True)),
         "cloud_buffer": [],
         "interval": max(1, int(cfg.get("interval_seconds", 10))),
         "heartbeat": max(5, int(cfg.get("heartbeat_seconds", 30))),

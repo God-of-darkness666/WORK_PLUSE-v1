@@ -30,6 +30,8 @@ import base64
 import hashlib
 import secrets
 import threading
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -54,6 +56,32 @@ TENANT_SLUG = os.environ.get("TENANT_SLUG", "workpulse")
 TENANT_NAME = os.environ.get("TENANT_NAME", "WorkPulse HQ")
 APP_VERSION = "3.0.0"
 PILOT_TENANT_ID = 1          # replaced at startup by the real row id
+
+# --- Phase 3: plans, billing, holder ---------------------------------------
+HOLDER_BOOTSTRAP_KEY = os.environ.get("HOLDER_BOOTSTRAP_KEY", API_KEY)
+RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "")
+RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
+RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
+
+# Real price list (INR, per month unless the plan bills annually).
+PLANS = {
+    "starter": {"name": "Starter", "min_seats": 5, "max_seats": 20,
+                "price_inr": 3500, "per_seat": False, "billing": "monthly",
+                "screenshots": False},
+    "business": {"name": "Business", "min_seats": 21, "max_seats": 40,
+                 "price_inr": 6400, "per_seat": False, "billing": "monthly",
+                 "screenshots": False},
+    "custom": {"name": "Custom", "min_seats": 41, "max_seats": 100,
+               "price_inr": 0, "per_seat": True, "price_per_seat": 150,
+               "billing": "monthly", "screenshots": False},
+    "enterprise": {"name": "Enterprise", "min_seats": 101, "max_seats": 100000,
+                   "price_inr": 0, "per_seat": True, "price_per_seat": 125,
+                   "billing": "annual", "annual_months": 10,
+                   "screenshots": True},
+    "pilot": {"name": "Pilot", "min_seats": 0, "max_seats": 100000,
+              "price_inr": 0, "per_seat": False, "billing": "monthly",
+              "screenshots": False, "unlimited": True},
+}
 
 app = Flask(__name__)
 
@@ -223,6 +251,52 @@ if MODE == "memory" and MYSQL_HOST:
                             prev_hash CHAR(64),
                             row_hash CHAR(64),
                             KEY idx_audit_tenant (tenant_id, id))""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS subscriptions (
+                            id INT AUTO_INCREMENT PRIMARY KEY,
+                            tenant_id INT NOT NULL UNIQUE,
+                            plan VARCHAR(20) NOT NULL DEFAULT 'pilot',
+                            seats INT NOT NULL DEFAULT 0,
+                            billing_cycle VARCHAR(12) NOT NULL DEFAULT 'monthly',
+                            status VARCHAR(24) NOT NULL DEFAULT 'active',
+                            amount_inr INT NOT NULL DEFAULT 0,
+                            started_at VARCHAR(32) NULL,
+                            current_period_end VARCHAR(32) NULL,
+                            payment_reference VARCHAR(80) NULL,
+                            razorpay_order_id VARCHAR(80) NULL,
+                            razorpay_payment_id VARCHAR(80) NULL,
+                            notes VARCHAR(255) NULL,
+                            updated_at VARCHAR(32) NULL,
+                            KEY idx_sub_status (status))""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS invoices (
+                            id INT AUTO_INCREMENT PRIMARY KEY,
+                            tenant_id INT NOT NULL,
+                            ts VARCHAR(32),
+                            plan VARCHAR(20),
+                            seats INT,
+                            amount_inr INT,
+                            status VARCHAR(20),
+                            reference VARCHAR(120),
+                            notes VARCHAR(255),
+                            KEY idx_inv_tenant (tenant_id, id))""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS holder_admins (
+                            id INT AUTO_INCREMENT PRIMARY KEY,
+                            email VARCHAR(190) NOT NULL UNIQUE,
+                            name VARCHAR(150),
+                            password_hash VARCHAR(255) NOT NULL,
+                            status VARCHAR(20) NOT NULL DEFAULT 'active',
+                            created_at VARCHAR(32),
+                            last_login VARCHAR(32))""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS holder_sessions (
+                            id INT AUTO_INCREMENT PRIMARY KEY,
+                            holder_id INT NOT NULL,
+                            token_hash CHAR(64) NOT NULL,
+                            expires_at VARCHAR(32) NOT NULL,
+                            created_at VARCHAR(32),
+                            revoked TINYINT NOT NULL DEFAULT 0,
+                            KEY idx_hsess_hash (token_hash))""")
+
+            # pilot subscription (unlimited, keeps existing data working)
+            # created after the pilot tenant id is resolved below
 
             # --- pilot tenant = the real organization that owns today's data
             cur.execute("SELECT id FROM tenants WHERE slug=%s", (TENANT_SLUG,))
@@ -234,6 +308,15 @@ if MODE == "memory" and MYSQL_HOST:
                             "VALUES (%s,%s,'active',%s)",
                             (TENANT_SLUG, TENANT_NAME, now_iso()))
                 PILOT_TENANT_ID = int(cur.lastrowid)
+
+            cur.execute("SELECT tenant_id FROM subscriptions WHERE tenant_id=%s",
+                        (PILOT_TENANT_ID,))
+            if not cur.fetchone():
+                cur.execute("INSERT INTO subscriptions (tenant_id, plan, seats, "
+                            "billing_cycle, status, amount_inr, started_at, "
+                            "updated_at, notes) VALUES (%s,'pilot',0,'monthly',"
+                            "'active',0,%s,%s,'pilot tenant - existing data')",
+                            (PILOT_TENANT_ID, now_iso(), now_iso()))
 
             # --- one-time, idempotent copy of the real legacy rows
             cur.execute("SELECT COUNT(*) FROM status_v2 WHERE tenant_id=%s",
@@ -743,7 +826,9 @@ def r_is_disabled():
     if not _rate_ok("api"):
         return jsonify({"error": "rate limit - slow down"}), 429
     return jsonify({"disabled": get_disabled(request.args.get("identity", ""),
-                                             PILOT_TENANT_ID)})
+                                             PILOT_TENANT_ID),
+                    "screenshots": _license_payload(
+                        PILOT_TENANT_ID)["features"]["screenshots_enabled"]})
 
 
 @app.post("/api/disable")
@@ -1176,6 +1261,12 @@ def v1_employee_create():
         return json_err("invalid_name", "employee name is required", 400)
     if email and not EMAIL_RE.match(email):
         return json_err("invalid_email", "enter a valid email", 400)
+    if not _tenant_writable(tid):
+        return json_err("subscription_inactive",
+                        "this workspace is suspended - renew the subscription", 402)
+    blocked = _seat_error(tid)
+    if blocked:
+        return blocked
     c = _sql(); cur = c.cursor()
     cur.execute("INSERT INTO employees (tenant_id, name, email, department, status, "
                 "created_at) VALUES (%s,%s,%s,%s,'active',%s)",
@@ -1373,14 +1464,768 @@ def v1_audit_write():
     return jsonify({"ok": True, "logged": rec})
 
 
+@app.get("/api/v1/plans")
+def v1_plans():
+    """Public price list (no auth) - used by the panel and the website."""
+    out = []
+    for key, p in PLANS.items():
+        if key == "pilot":
+            continue
+        out.append({"id": key, "name": p["name"], "min_seats": p["min_seats"],
+                    "max_seats": p["max_seats"],
+                    "price_inr": p.get("price_inr", 0),
+                    "per_seat": p.get("per_seat", False),
+                    "price_per_seat": p.get("price_per_seat", 0),
+                    "billing": p["billing"],
+                    "annual_months": p.get("annual_months"),
+                    "screenshots": p["screenshots"]})
+    return jsonify({"plans": out, "currency": "INR"})
+
+
+def _tenant_config(tid: int) -> dict:
+    tenant = _tenant_row(tid) or {}
+    try:
+        cfg = json.loads(tenant.get("config") or "{}")
+    except Exception:
+        cfg = {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _save_tenant_config(tid: int, cfg: dict) -> None:
+    c = _sql(); cur = c.cursor()
+    cur.execute("UPDATE tenants SET config=%s WHERE id=%s",
+                (json.dumps(cfg, ensure_ascii=False), tid))
+    c.close()
+
+
+def _subscription(tid: int) -> dict:
+    c = _sql(); cur = c.cursor()
+    cur.execute("SELECT plan, seats, billing_cycle, status, amount_inr, "
+                "started_at, current_period_end, payment_reference, "
+                "razorpay_order_id, razorpay_payment_id, notes, updated_at "
+                "FROM subscriptions WHERE tenant_id=%s", (tid,))
+    row = cur.fetchone()
+    c.close()
+    if not row:
+        return {"plan": "pilot", "seats": 0, "billing_cycle": "monthly",
+                "status": "active", "amount_inr": 0, "started_at": None,
+                "current_period_end": None, "payment_reference": None,
+                "razorpay_order_id": None, "razorpay_payment_id": None,
+                "notes": None, "updated_at": None}
+    keys = ("plan", "seats", "billing_cycle", "status", "amount_inr",
+            "started_at", "current_period_end", "payment_reference",
+            "razorpay_order_id", "razorpay_payment_id", "notes", "updated_at")
+    return dict(zip(keys, row))
+
+
+def _plan_amount(plan: str, seats: int, cycle: str) -> int:
+    p = PLANS.get(plan) or {}
+    if p.get("unlimited"):
+        return 0
+    if p.get("per_seat"):
+        monthly = int(seats) * int(p.get("price_per_seat") or 0)
+    else:
+        monthly = int(p.get("price_inr") or 0)
+    if cycle == "annual":
+        return monthly * int(p.get("annual_months") or 12)
+    return monthly
+
+
+def _seat_usage(tid: int) -> dict:
+    c = _sql(); cur = c.cursor()
+    cur.execute("SELECT COUNT(*) FROM employees WHERE tenant_id=%s AND status='active'",
+                (tid,))
+    employees = int(cur.fetchone()[0])
+    cur.execute("SELECT COUNT(*) FROM devices WHERE tenant_id=%s AND status='active' "
+                "AND employee_id IS NULL", (tid,))
+    unassigned = int(cur.fetchone()[0])
+    c.close()
+    return {"employees": employees, "unassigned_devices": unassigned,
+            "used": employees + unassigned}
+
+
+def _seat_limit(tid: int):
+    sub = _subscription(tid)
+    plan = PLANS.get(sub["plan"]) or PLANS["pilot"]
+    if plan.get("unlimited"):
+        return None
+    return int(sub.get("seats") or plan.get("max_seats") or 0)
+
+
+def _seat_error(tid: int, adding: int = 1):
+    limit = _seat_limit(tid)
+    if limit is None:
+        return None
+    usage = _seat_usage(tid)
+    if usage["used"] + adding > limit:
+        return json_err("seat_limit",
+                        f"your plan allows {limit} seats and {usage['used']} are "
+                        "in use - upgrade the plan to add more", 402)
+    return None
+
+
+def _tenant_writable(tid: int) -> bool:
+    sub = _subscription(tid)
+    if sub["status"] in ("active", "past_due", "pending_payment"):
+        tenant = _tenant_row(tid) or {}
+        return tenant.get("status") != "suspended"
+    return False
+
+
+def _days_left(value):
+    if not value:
+        return None
+    try:
+        end = datetime.fromisoformat(str(value)[:19])
+        return max(0, (end - now_dt()).days)
+    except Exception:
+        return None
+
+
+def _license_payload(tid: int) -> dict:
+    tenant = _tenant_row(tid) or {}
+    sub = _subscription(tid)
+    plan = PLANS.get(sub["plan"]) or PLANS["pilot"]
+    usage = _seat_usage(tid)
+    limit = _seat_limit(tid)
+    cfg = _tenant_config(tid)
+    screenshot_entitled = bool(plan.get("screenshots")) and sub["status"] == "active"
+    screenshots_on = screenshot_entitled and bool(cfg.get("screenshots_enabled", False))
+    return {
+        "tenant": tenant.get("name"),
+        "tenant_status": tenant.get("status", "active"),
+        "plan": sub["plan"], "plan_name": plan["name"],
+        "seats": limit, "seats_used": usage["used"],
+        "employees": usage["employees"],
+        "unassigned_devices": usage["unassigned_devices"],
+        "seats_available": (None if limit is None else max(0, limit - usage["used"])),
+        "billing_cycle": sub["billing_cycle"],
+        "status": sub["status"], "amount_inr": sub["amount_inr"],
+        "started_at": sub["started_at"],
+        "expires_at": sub["current_period_end"],
+        "days_left": _days_left(sub["current_period_end"]),
+        "features": {"screenshots_entitled": screenshot_entitled,
+                     "screenshots_enabled": screenshots_on},
+        "price_list": {k: {"name": v["name"], "min_seats": v["min_seats"],
+                           "max_seats": v["max_seats"],
+                           "price_inr": v.get("price_inr", 0),
+                           "per_seat": v.get("per_seat", False),
+                           "price_per_seat": v.get("price_per_seat", 0),
+                           "billing": v["billing"]}
+                       for k, v in PLANS.items() if k != "pilot"},
+    }
+
+
+def _activate_subscription(tid: int, reference: str, payment_id: str = "",
+                           order_id: str = "", amount_inr: int = 0,
+                           note: str = "razorpay") -> dict:
+    sub = _subscription(tid)
+    cycle = sub.get("billing_cycle") or "monthly"
+    months = 12 if cycle == "annual" else 1
+    start = now_dt()
+    end = start + timedelta(days=30 * months)
+    c = _sql(); cur = c.cursor()
+    cur.execute("UPDATE subscriptions SET status='active', started_at=%s, "
+                "current_period_end=%s, razorpay_payment_id=%s, "
+                "razorpay_order_id=%s, updated_at=%s, amount_inr=%s, notes=%s "
+                "WHERE tenant_id=%s",
+                (start.isoformat(timespec="seconds"),
+                 end.isoformat(timespec="seconds"), payment_id or None,
+                 order_id or None, now_iso(),
+                 amount_inr or sub.get("amount_inr") or 0, note[:255], tid))
+    cur.execute("UPDATE tenants SET status='active' WHERE id=%s", (tid,))
+    cur.execute("UPDATE invoices SET status='paid' WHERE tenant_id=%s AND "
+                "reference=%s", (tid, reference))
+    c.close()
+    audit("billing.activated", f"{tid}:{reference}", "ok", tenant_id=tid,
+          actor_type="system", actor_id="billing")
+    return _license_payload(tid)
+
+
+def _razorpay_payment_link(amount_inr: int, reference: str, description: str,
+                           email: str = "") -> tuple:
+    """Create a hosted Razorpay Payment Link (open the short_url in any browser).
+
+    Returns (data, error). error is 'billing_not_configured' when keys are absent.
+    """
+    if not (RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET):
+        return None, "billing_not_configured"
+    auth = base64.b64encode(f"{RAZORPAY_KEY_ID}:{RAZORPAY_KEY_SECRET}"
+                            .encode()).decode()
+    payload = {
+        "amount": int(amount_inr) * 100,
+        "currency": "INR",
+        "accept_partial": False,
+        "description": description[:200],
+        "reference_id": reference,
+        "reminder_enable": True,
+        "notes": {"reference_id": reference, "product": "WorkPulse"},
+    }
+    if email:
+        payload["customer"] = {"email": email}
+    req = urllib.request.Request(
+        "https://api.razorpay.com/v1/payment_links",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Basic " + auth})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode()), None
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read().decode())
+        except Exception:
+            detail = {"error": {"description": f"HTTP {e.code}"}}
+        return detail, "razorpay_error"
+    except Exception as e:
+        return {"error": {"description": str(e)}}, "razorpay_unreachable"
+
+
+def _razorpay_verify_payment(order_id: str, payment_id: str, signature: str) -> bool:
+    if not RAZORPAY_KEY_SECRET:
+        return False
+    expected = hmac.new(RAZORPAY_KEY_SECRET.encode(),
+                        f"{order_id}|{payment_id}".encode(),
+                        hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature or "")
+
+
 @app.get("/api/v1/admin/license")
 @mysql_required
 @admin_required
 def v1_license():
-    tenant = _tenant_row(g.admin["tenant_id"]) or {}
-    return jsonify({"status": tenant.get("status", "active"),
-                    "plan": "pilot", "seats": None, "expires_at": None,
-                    "tenant": tenant.get("name")})
+    return jsonify(_license_payload(g.admin["tenant_id"]))
+
+
+@app.get("/api/v1/admin/subscription")
+@mysql_required
+@admin_required
+def v1_subscription():
+    return jsonify(_license_payload(g.admin["tenant_id"]))
+
+
+@app.post("/api/v1/admin/subscription/request")
+@mysql_required
+@admin_required
+def v1_subscription_request():
+    if g.admin.get("role") != "owner":
+        return json_err("forbidden", "only the owner can change the plan", 403)
+    tid = g.admin["tenant_id"]
+    body = request.get_json(silent=True) or {}
+    plan = str(body.get("plan") or "").strip().lower()
+    if plan not in PLANS or plan == "pilot":
+        return json_err("invalid_plan", "choose starter, business, custom or enterprise", 400)
+    p = PLANS[plan]
+    try:
+        seats = int(body.get("seats") or p["min_seats"])
+    except Exception:
+        return json_err("invalid_seats", "seats must be a number", 400)
+    if seats < p["min_seats"] or seats > p["max_seats"]:
+        return json_err("invalid_seats",
+                        f"{p['name']} needs {p['min_seats']}-{p['max_seats']} seats", 400)
+    cycle = str(body.get("billing_cycle") or p["billing"]).lower()
+    if cycle not in ("monthly", "annual"):
+        return json_err("invalid_cycle", "billing_cycle must be monthly or annual", 400)
+    if p["billing"] == "annual":
+        cycle = "annual"
+    amount = _plan_amount(plan, seats, cycle)
+    reference = f"wp-{tid}-{int(time.time())}-{secrets.token_hex(3)}"
+    c = _sql(); cur = c.cursor()
+    cur.execute("SELECT tenant_id FROM subscriptions WHERE tenant_id=%s", (tid,))
+    exists = cur.fetchone()
+    if exists:
+        cur.execute("UPDATE subscriptions SET plan=%s, seats=%s, billing_cycle=%s, "
+                    "status='pending_payment', amount_inr=%s, payment_reference=%s, "
+                    "razorpay_order_id=NULL, razorpay_payment_id=NULL, updated_at=%s "
+                    "WHERE tenant_id=%s",
+                    (plan, seats, cycle, amount, reference, now_iso(), tid))
+    else:
+        cur.execute("INSERT INTO subscriptions (tenant_id, plan, seats, billing_cycle, "
+                    "status, amount_inr, payment_reference, updated_at) "
+                    "VALUES (%s,%s,%s,%s,'pending_payment',%s,%s,%s)",
+                    (tid, plan, seats, cycle, amount, reference, now_iso()))
+    cur.execute("INSERT INTO invoices (tenant_id, ts, plan, seats, amount_inr, status, "
+                "reference, notes) VALUES (%s,%s,%s,%s,%s,'pending',%s,'plan request')",
+                (tid, now_iso(), plan, seats, amount, reference))
+    c.close()
+    audit("billing.requested", f"{plan}:{seats}:{cycle}", f"{amount} INR",
+          tenant_id=tid)
+    email = g.admin.get("email", "")
+    link, err = _razorpay_payment_link(
+        amount, reference,
+        f"WorkPulse {p['name']} - {seats} seats ({cycle})", email)
+    payment = {"provider": "razorpay", "configured": bool(link),
+               "reference": reference}
+    if link:
+        payment.update({"short_url": link.get("short_url"),
+                        "payment_link_id": link.get("id"),
+                        "status": link.get("status")})
+    else:
+        payment["error"] = err
+        payment["instructions"] = (
+            "Razorpay keys are not set on the server. Add RAZORPAY_KEY_ID and "
+            "RAZORPAY_KEY_SECRET on Render, or record an offline payment in the "
+            "holder panel to activate this subscription.")
+    return jsonify({"ok": True, "subscription": _subscription(tid),
+                    "amount_inr": amount, "payment": payment}), 201
+
+
+@app.post("/api/v1/admin/subscription/verify")
+@mysql_required
+@admin_required
+def v1_subscription_verify():
+    tid = g.admin["tenant_id"]
+    body = request.get_json(silent=True) or {}
+    order_id = str(body.get("razorpay_order_id") or "").strip()
+    payment_id = str(body.get("razorpay_payment_id") or "").strip()
+    signature = str(body.get("razorpay_signature") or "").strip()
+    if not (order_id and payment_id and signature):
+        return json_err("invalid_request", "order, payment and signature are required", 400)
+    if not _razorpay_verify_payment(order_id, payment_id, signature):
+        return json_err("invalid_signature", "payment signature verification failed", 400)
+    sub = _subscription(tid)
+    if order_id not in (sub.get("razorpay_order_id"),):
+        return json_err("not_found", "no pending order for this tenant", 404)
+    return jsonify({"ok": True, "license": _activate_subscription(
+        tid, sub.get("payment_reference") or order_id, payment_id, order_id)})
+
+
+@app.post("/api/v1/admin/settings/screenshots")
+@mysql_required
+@admin_required
+def v1_screenshots_setting():
+    if g.admin.get("role") != "owner":
+        return json_err("forbidden", "only the owner can change this setting", 403)
+    tid = g.admin["tenant_id"]
+    body = request.get_json(silent=True) or {}
+    enabled = bool(body.get("enabled"))
+    lic = _license_payload(tid)
+    if enabled and not lic["features"]["screenshots_entitled"]:
+        return json_err("plan_required",
+                        "screenshots are an Enterprise feature - upgrade to enable",
+                        402)
+    cfg = _tenant_config(tid)
+    cfg["screenshots_enabled"] = enabled
+    _save_tenant_config(tid, cfg)
+    audit("settings.screenshots", "on" if enabled else "off", "ok")
+    return jsonify({"ok": True, "enabled": enabled,
+                    "license": _license_payload(tid)})
+
+
+@app.post("/api/v1/billing/razorpay/webhook")
+@mysql_required
+def v1_razorpay_webhook():
+    """Razorpay webhook: activates the tenant when a payment link is paid."""
+    raw = request.get_data() or b""
+    if RAZORPAY_WEBHOOK_SECRET:
+        got = request.headers.get("X-Razorpay-Signature", "")
+        want = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode(), raw,
+                        hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(want, got):
+            return json_err("invalid_signature", "webhook signature mismatch", 400)
+    body = request.get_json(silent=True) or {}
+    event = str(body.get("event") or "")
+    payload = body.get("payload") or {}
+    reference = ""
+    payment_id = ""
+    order_id = ""
+    amount = 0
+    try:
+        if "payment_link" in payload:
+            ent = payload["payment_link"]["entity"]
+            reference = str(ent.get("reference_id") or "")
+            payment_id = str((payload.get("payment") or {}).get("entity", {})
+                             .get("id") or "")
+        if "payment" in payload:
+            ent = payload["payment"]["entity"]
+            payment_id = payment_id or str(ent.get("id") or "")
+            order_id = str(ent.get("order_id") or "")
+            reference = reference or str((ent.get("notes") or {}).get("reference_id") or "")
+            amount = int(ent.get("amount") or 0) // 100
+    except Exception:
+        reference = reference or ""
+    if event not in ("payment_link.paid", "payment.captured", "order.paid"):
+        return jsonify({"ok": True, "ignored": event})
+    c = _sql(); cur = c.cursor()
+    row = None
+    if reference:
+        cur.execute("SELECT tenant_id FROM subscriptions WHERE payment_reference=%s",
+                    (reference,))
+        row = cur.fetchone()
+    if not row and order_id:
+        cur.execute("SELECT tenant_id FROM subscriptions WHERE razorpay_order_id=%s",
+                    (order_id,))
+        row = cur.fetchone()
+    c.close()
+    if not row:
+        return jsonify({"ok": True, "warning": "no matching subscription",
+                        "reference": reference})
+    lic = _activate_subscription(int(row[0]), reference, payment_id, order_id,
+                                 amount or 0)
+    return jsonify({"ok": True, "license": lic})
+
+
+# ------------------------------------------------------------------ holder
+def holder_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        auth = request.headers.get("Authorization", "")
+        token = auth[7:].strip() if auth.startswith("Bearer ") else ""
+        payload = read_access(token)
+        if not payload or payload.get("role") != "holder":
+            return json_err("unauthorized", "holder token required", 401)
+        g.holder = payload
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def _issue_holder_refresh(holder_id: int):
+    raw = secrets.token_urlsafe(48)
+    expires = _future_iso(REFRESH_TTL)
+    c = _sql(); cur = c.cursor()
+    cur.execute("INSERT INTO holder_sessions (holder_id, token_hash, expires_at, "
+                "created_at) VALUES (%s,%s,%s,%s)",
+                (holder_id, _sha(raw), expires, now_iso()))
+    c.close()
+    return raw, expires
+
+
+@app.get("/api/v1/holder/auth/status")
+def v1_holder_status():
+    initialized = False
+    if MODE == "mysql":
+        try:
+            c = _sql(); cur = c.cursor()
+            cur.execute("SELECT COUNT(*) FROM holder_admins")
+            initialized = cur.fetchone()[0] > 0
+            c.close()
+        except Exception:
+            initialized = False
+    return jsonify({"initialized": initialized, "version": APP_VERSION,
+                    "service": "WorkPulse"})
+
+
+@app.post("/api/v1/holder/auth/bootstrap")
+@mysql_required
+def v1_holder_bootstrap():
+    if not _rate_ok_key("holder_bootstrap", 5, 300):
+        return json_err("rate_limited", "too many attempts", 429)
+    key = request.headers.get("X-Holder-Bootstrap-Key", "")
+    if not (key and hmac.compare_digest(key, HOLDER_BOOTSTRAP_KEY)):
+        return json_err("forbidden", "bad holder bootstrap key", 403)
+    body = request.get_json(silent=True) or {}
+    email = str(body.get("email") or "").strip().lower()
+    password = str(body.get("password") or "")
+    name = str(body.get("name") or "WorkPulse Holder").strip()[:150]
+    if not EMAIL_RE.match(email):
+        return json_err("invalid_email", "enter a valid email", 400)
+    if len(password) < 10:
+        return json_err("weak_password", "password must be at least 10 characters", 400)
+    c = _sql(); cur = c.cursor()
+    cur.execute("SELECT COUNT(*) FROM holder_admins")
+    if cur.fetchone()[0] > 0:
+        c.close()
+        return json_err("already_initialized", "a holder account already exists", 409)
+    cur.execute("INSERT INTO holder_admins (email, name, password_hash, status, "
+                "created_at) VALUES (%s,%s,%s,'active',%s)",
+                (email, name, generate_password_hash(password), now_iso()))
+    c.close()
+    return jsonify({"ok": True, "email": email}), 201
+
+
+@app.post("/api/v1/holder/auth/login")
+@mysql_required
+def v1_holder_login():
+    if not _rate_ok_key("holder_login", 10, 900):
+        return json_err("rate_limited", "too many attempts, wait 15 minutes", 429)
+    body = request.get_json(silent=True) or {}
+    email = str(body.get("email") or "").strip().lower()
+    password = str(body.get("password") or "")
+    c = _sql(); cur = c.cursor()
+    cur.execute("SELECT id, email, name, password_hash, status FROM holder_admins "
+                "WHERE email=%s", (email,))
+    row = cur.fetchone()
+    if not row or row[4] != "active" or not check_password_hash(row[3], password):
+        c.close()
+        return json_err("invalid_credentials", "email or password is incorrect", 401)
+    cur.execute("UPDATE holder_admins SET last_login=%s WHERE id=%s",
+                (now_iso(), row[0]))
+    c.close()
+    holder = {"id": int(row[0]), "tenant_id": 0, "role": "holder",
+              "email": row[1], "name": row[2]}
+    access = make_access(holder)
+    refresh, refresh_exp = _issue_holder_refresh(holder["id"])
+    return jsonify({"access_token": access, "refresh_token": refresh,
+                    "token_type": "Bearer", "expires_in": ACCESS_TTL,
+                    "refresh_expires_at": refresh_exp, "holder": holder})
+
+
+@app.post("/api/v1/holder/auth/refresh")
+@mysql_required
+def v1_holder_refresh():
+    body = request.get_json(silent=True) or {}
+    raw = str(body.get("refresh_token") or "").strip()
+    if not raw:
+        return json_err("unauthorized", "refresh token required", 401)
+    c = _sql(); cur = c.cursor()
+    cur.execute("SELECT s.id, s.holder_id, s.expires_at, s.revoked, h.status, "
+                "h.email, h.name FROM holder_sessions s JOIN holder_admins h "
+                "ON h.id = s.holder_id WHERE s.token_hash=%s", (_sha(raw),))
+    row = cur.fetchone()
+    if not row or row[3] or row[4] != "active" or str(row[2]) < now_iso():
+        c.close()
+        return json_err("unauthorized", "refresh token invalid or expired", 401)
+    cur.execute("UPDATE holder_sessions SET revoked=1 WHERE id=%s", (row[0],))
+    c.close()
+    holder = {"id": int(row[1]), "tenant_id": 0, "role": "holder",
+              "email": row[5], "name": row[6]}
+    access = make_access(holder)
+    refresh, refresh_exp = _issue_holder_refresh(holder["id"])
+    return jsonify({"access_token": access, "refresh_token": refresh,
+                    "token_type": "Bearer", "expires_in": ACCESS_TTL,
+                    "refresh_expires_at": refresh_exp, "holder": holder})
+
+
+@app.post("/api/v1/holder/auth/logout")
+@mysql_required
+def v1_holder_logout():
+    body = request.get_json(silent=True) or {}
+    raw = str(body.get("refresh_token") or "").strip()
+    if raw:
+        c = _sql(); cur = c.cursor()
+        cur.execute("UPDATE holder_sessions SET revoked=1 WHERE token_hash=%s",
+                    (_sha(raw),))
+        c.close()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/v1/holder/summary")
+@mysql_required
+@holder_required
+def v1_holder_summary():
+    c = _sql(); cur = c.cursor()
+    cur.execute("SELECT COUNT(*) FROM tenants")
+    tenants = int(cur.fetchone()[0])
+    cur.execute("SELECT COUNT(*) FROM tenants WHERE status='active'")
+    active = int(cur.fetchone()[0])
+    cur.execute("SELECT plan, status, seats, amount_inr, billing_cycle "
+                "FROM subscriptions")
+    rows = cur.fetchall()
+    mrr = 0
+    paying = 0
+    for plan, status, seats, amount, cycle in rows:
+        if status != "active" or plan == "pilot":
+            continue
+        paying += 1
+        mrr += int(amount or 0) // (12 if cycle == "annual" else 1)
+    cur.execute("SELECT COUNT(*) FROM employees WHERE status='active'")
+    seats_used = int(cur.fetchone()[0])
+    cur.execute("SELECT COUNT(*) FROM devices WHERE status='active'")
+    devices = int(cur.fetchone()[0])
+    cur.execute("SELECT COALESCE(SUM(amount_inr),0) FROM invoices WHERE status='paid'")
+    collected = int(cur.fetchone()[0])
+    c.close()
+    return jsonify({"tenants": tenants, "active_tenants": active,
+                    "paying_tenants": paying, "mrr_inr": mrr,
+                    "arr_inr": mrr * 12, "collected_inr": collected,
+                    "seats_used": seats_used, "devices": devices,
+                    "server_time": now_iso()})
+
+
+@app.get("/api/v1/holder/tenants")
+@mysql_required
+@holder_required
+def v1_holder_tenants():
+    c = _sql(); cur = c.cursor()
+    cur.execute("SELECT t.id, t.slug, t.name, t.status, t.created_at, "
+                "s.plan, s.seats, s.billing_cycle, s.status AS sub_status, "
+                "s.amount_inr, s.current_period_end, "
+                "(SELECT COUNT(*) FROM employees e WHERE e.tenant_id=t.id AND "
+                " e.status='active'), "
+                "(SELECT COUNT(*) FROM devices d WHERE d.tenant_id=t.id AND "
+                " d.status='active'), "
+                "(SELECT MAX(x.last_seen) FROM status_v2 x WHERE x.tenant_id=t.id) "
+                "FROM tenants t LEFT JOIN subscriptions s ON s.tenant_id=t.id "
+                "ORDER BY t.id")
+    rows = [{"id": r[0], "slug": r[1], "name": r[2], "status": r[3],
+             "created_at": r[4], "plan": r[5] or "pilot", "seats": r[6] or 0,
+             "billing_cycle": r[7], "subscription_status": r[8] or "active",
+             "amount_inr": r[9] or 0, "current_period_end": r[10],
+             "employees": r[11], "devices": r[12], "last_seen": r[13]}
+            for r in cur.fetchall()]
+    c.close()
+    return jsonify({"tenants": rows, "count": len(rows)})
+
+
+@app.post("/api/v1/holder/tenants")
+@mysql_required
+@holder_required
+def v1_holder_tenant_create():
+    body = request.get_json(silent=True) or {}
+    name = str(body.get("name") or "").strip()[:150]
+    slug = re.sub(r"[^a-z0-9-]", "", str(body.get("slug") or "").strip().lower())[:60]
+    email = str(body.get("owner_email") or "").strip().lower()
+    password = str(body.get("owner_password") or "")
+    plan = str(body.get("plan") or "starter").strip().lower()
+    if not name or not slug:
+        return json_err("invalid_request", "name and slug are required", 400)
+    if plan not in PLANS or plan == "pilot":
+        return json_err("invalid_plan", "choose a paid plan", 400)
+    if not EMAIL_RE.match(email):
+        return json_err("invalid_email", "enter a valid owner email", 400)
+    if len(password) < 10:
+        return json_err("weak_password", "owner password must be at least 10 characters", 400)
+    p = PLANS[plan]
+    try:
+        seats = int(body.get("seats") or p["min_seats"])
+    except Exception:
+        seats = p["min_seats"]
+    if seats < p["min_seats"] or seats > p["max_seats"]:
+        return json_err("invalid_seats", f"{p['name']} needs "
+                        f"{p['min_seats']}-{p['max_seats']} seats", 400)
+    cycle = "annual" if p["billing"] == "annual" else "monthly"
+    amount = _plan_amount(plan, seats, cycle)
+    c = _sql(); cur = c.cursor()
+    cur.execute("SELECT id FROM tenants WHERE slug=%s", (slug,))
+    if cur.fetchone():
+        c.close()
+        return json_err("slug_taken", "that slug already exists", 409)
+    cur.execute("INSERT INTO tenants (slug, name, status, created_at) "
+                "VALUES (%s,%s,'active',%s)", (slug, name, now_iso()))
+    tid = int(cur.lastrowid)
+    cur.execute("INSERT INTO subscriptions (tenant_id, plan, seats, billing_cycle, "
+                "status, amount_inr, started_at, updated_at, notes) "
+                "VALUES (%s,%s,%s,%s,'pending_payment',%s,%s,%s,'created by holder')",
+                (tid, plan, seats, cycle, amount, now_iso(), now_iso()))
+    cur.execute("INSERT INTO admins (tenant_id, email, password_hash, role, status, "
+                "created_at) VALUES (%s,%s,%s,'owner','active',%s)",
+                (tid, email, generate_password_hash(password), now_iso()))
+    cur.execute("INSERT INTO invoices (tenant_id, ts, plan, seats, amount_inr, "
+                "status, notes) VALUES (%s,%s,%s,%s,%s,'pending','holder created')",
+                (tid, now_iso(), plan, seats, amount))
+    c.close()
+    audit("tenant.created", f"{tid}:{slug}", "ok", tenant_id=tid,
+          actor_type="holder", actor_id=g.holder.get("email", "holder"))
+    return jsonify({"ok": True, "tenant_id": tid, "slug": slug, "plan": plan,
+                    "seats": seats, "amount_inr": amount}), 201
+
+
+@app.get("/api/v1/holder/tenants/<int:tid>")
+@mysql_required
+@holder_required
+def v1_holder_tenant_detail(tid: int):
+    tenant = _tenant_row(tid)
+    if not tenant:
+        return json_err("not_found", "tenant not found", 404)
+    lic = _license_payload(tid)
+    c = _sql(); cur = c.cursor()
+    cur.execute("SELECT id, email, role, status, created_at, last_login FROM admins "
+                "WHERE tenant_id=%s ORDER BY id", (tid,))
+    admins = [{"id": r[0], "email": r[1], "role": r[2], "status": r[3],
+               "created_at": r[4], "last_login": r[5]} for r in cur.fetchall()]
+    cur.execute("SELECT ts, action, target, result FROM audit_v2 WHERE tenant_id=%s "
+                "ORDER BY id DESC LIMIT 20", (tid,))
+    audit_rows = [{"ts": r[0], "action": r[1], "target": r[2], "result": r[3]}
+                  for r in cur.fetchall()]
+    cur.execute("SELECT ts, plan, seats, amount_inr, status, reference FROM invoices "
+                "WHERE tenant_id=%s ORDER BY id DESC LIMIT 20", (tid,))
+    invoices = [{"ts": r[0], "plan": r[1], "seats": r[2], "amount_inr": r[3],
+                 "status": r[4], "reference": r[5]} for r in cur.fetchall()]
+    c.close()
+    return jsonify({"tenant": tenant, "license": lic, "admins": admins,
+                    "audit": audit_rows, "invoices": invoices})
+
+
+@app.put("/api/v1/holder/tenants/<int:tid>/subscription")
+@mysql_required
+@holder_required
+def v1_holder_set_subscription(tid: int):
+    if not _tenant_row(tid):
+        return json_err("not_found", "tenant not found", 404)
+    body = request.get_json(silent=True) or {}
+    sub = _subscription(tid)
+    plan = str(body.get("plan") or sub["plan"]).strip().lower()
+    if plan not in PLANS:
+        return json_err("invalid_plan", "unknown plan", 400)
+    p = PLANS[plan]
+    try:
+        seats = int(body.get("seats") or sub["seats"] or p["min_seats"])
+    except Exception:
+        seats = p["min_seats"]
+    cycle = str(body.get("billing_cycle") or sub["billing_cycle"] or "monthly")
+    status = str(body.get("status") or "active").lower()
+    if status not in ("active", "pending_payment", "past_due", "suspended", "cancelled"):
+        return json_err("invalid_status", "unknown subscription status", 400)
+    amount = _plan_amount(plan, seats, cycle) if plan != "pilot" else 0
+    period_end = str(body.get("current_period_end") or "").strip() or None
+    if status == "active" and not period_end:
+        months = 12 if cycle == "annual" else 1
+        period_end = (now_dt() + timedelta(days=30 * months)).isoformat(timespec="seconds")
+    started = sub.get("started_at") or now_iso()
+    c = _sql(); cur = c.cursor()
+    cur.execute("UPDATE subscriptions SET plan=%s, seats=%s, billing_cycle=%s, "
+                "status=%s, amount_inr=%s, started_at=%s, current_period_end=%s, "
+                "updated_at=%s, notes=%s WHERE tenant_id=%s",
+                (plan, seats, cycle, status, amount, started, period_end,
+                 now_iso(), str(body.get("notes") or sub.get("notes") or "")[:255], tid))
+    cur.execute("UPDATE tenants SET status=%s WHERE id=%s",
+                ("suspended" if status == "suspended" else "active", tid))
+    if str(body.get("record_invoice")).lower() in ("1", "true", "yes"):
+        cur.execute("INSERT INTO invoices (tenant_id, ts, plan, seats, amount_inr, "
+                    "status, reference, notes) VALUES (%s,%s,%s,%s,%s,'paid',%s,%s)",
+                    (tid, now_iso(), plan, seats, amount,
+                     f"offline-{int(time.time())}",
+                     str(body.get("payment_reference") or "offline/manual")[:120]))
+    c.close()
+    audit("holder.subscription_set", f"{plan}:{seats}:{status}", "ok", tenant_id=tid,
+          actor_type="holder", actor_id=g.holder.get("email", "holder"))
+    return jsonify({"ok": True, "license": _license_payload(tid)})
+
+
+@app.patch("/api/v1/holder/tenants/<int:tid>")
+@mysql_required
+@holder_required
+def v1_holder_tenant_update(tid: int):
+    if not _tenant_row(tid):
+        return json_err("not_found", "tenant not found", 404)
+    body = request.get_json(silent=True) or {}
+    c = _sql(); cur = c.cursor()
+    if "status" in body:
+        status = str(body.get("status") or "").lower()
+        if status not in ("active", "suspended", "closed"):
+            c.close()
+            return json_err("invalid_status", "active, suspended or closed", 400)
+        cur.execute("UPDATE tenants SET status=%s WHERE id=%s", (status, tid))
+    if isinstance(body.get("config"), dict):
+        cfg = _tenant_config(tid)
+        cfg.update(body["config"])
+        cur.execute("UPDATE tenants SET config=%s WHERE id=%s",
+                    (json.dumps(cfg, ensure_ascii=False), tid))
+    c.close()
+    audit("holder.tenant_updated", str(tid), "ok", tenant_id=tid,
+          actor_type="holder", actor_id=g.holder.get("email", "holder"))
+    return jsonify({"ok": True, "tenant": _tenant_row(tid),
+                    "license": _license_payload(tid)})
+
+
+@app.get("/api/v1/holder/invoices")
+@mysql_required
+@holder_required
+def v1_holder_invoices():
+    tid = request.args.get("tenant_id", type=int)
+    c = _sql(); cur = c.cursor()
+    if tid:
+        cur.execute("SELECT id, tenant_id, ts, plan, seats, amount_inr, status, "
+                    "reference, notes FROM invoices WHERE tenant_id=%s "
+                    "ORDER BY id DESC LIMIT 200", (tid,))
+    else:
+        cur.execute("SELECT id, tenant_id, ts, plan, seats, amount_inr, status, "
+                    "reference, notes FROM invoices ORDER BY id DESC LIMIT 200")
+    rows = [{"id": r[0], "tenant_id": r[1], "ts": r[2], "plan": r[3],
+             "seats": r[4], "amount_inr": r[5], "status": r[6],
+             "reference": r[7], "notes": r[8]} for r in cur.fetchall()]
+    c.close()
+    return jsonify({"invoices": rows, "count": len(rows)})
 
 
 # ---------------------------------------------------------------- agent API v3
@@ -1443,6 +2288,33 @@ def v1_enroll():
     cur.execute("SELECT id FROM devices WHERE tenant_id=%s AND device_uid=%s",
                 (tid, device_uid))
     existing = cur.fetchone()
+
+    # subscription gates (free the one-time code if the tenant cannot add a device)
+    cur.execute("SELECT status FROM tenants WHERE id=%s", (tid,))
+    trow = cur.fetchone()
+    if not trow or trow[0] == "suspended":
+        cur.execute("UPDATE enrollment_codes SET used_at=NULL WHERE id=%s", (code_id,))
+        c.close()
+        return json_err("subscription_inactive",
+                        "this workspace is suspended - contact WorkPulse", 402)
+    if not existing and not employee_id:
+        cur.execute("SELECT plan, seats FROM subscriptions WHERE tenant_id=%s", (tid,))
+        srow = cur.fetchone()
+        if srow and srow[0] != "pilot":
+            limit = int(srow[1] or 0)
+            cur.execute("SELECT COUNT(*) FROM employees WHERE tenant_id=%s "
+                        "AND status='active'", (tid,))
+            used = int(cur.fetchone()[0])
+            cur.execute("SELECT COUNT(*) FROM devices WHERE tenant_id=%s "
+                        "AND status='active' AND employee_id IS NULL", (tid,))
+            used += int(cur.fetchone()[0])
+            if limit and used + 1 > limit:
+                cur.execute("UPDATE enrollment_codes SET used_at=NULL WHERE id=%s",
+                            (code_id,))
+                c.close()
+                return json_err("seat_limit",
+                                f"your plan allows {limit} seats and {used} are in "
+                                "use - upgrade the plan to enroll more devices", 402)
     if existing:
         device_id = int(existing[0])
         cur.execute("UPDATE devices SET employee_id=%s, identity=%s, name=%s, os=%s, "
@@ -1550,9 +2422,13 @@ def v1_agent_config_payload(tenant_id: int, identity: str = "") -> dict:
         cfg = {}
     cfg.setdefault("retention_days", 90)
     cfg.setdefault("heartbeat_seconds", 60)
-    cfg.setdefault("screenshots", None)      # null = agent keeps its local setting
     if identity:
+        lic = _license_payload(tenant_id)
+        cfg["screenshots"] = lic["features"]["screenshots_enabled"]
+        cfg["plan"] = lic["plan"]
         cfg["disabled"] = get_disabled(identity, tenant_id)
+    else:
+        cfg.setdefault("screenshots", False)
     cfg["server_time"] = now_iso()
     return cfg
 
@@ -1561,10 +2437,13 @@ def v1_agent_config_payload(tenant_id: int, identity: str = "") -> dict:
 @mysql_required
 @device_required
 def v1_agent_state():
-    """Tiny poll used by the agent every cycle: is this worker disabled?"""
+    """Tiny poll used by the agent every cycle: kill switch + screenshot right."""
     tid = g.device["tenant_id"]
+    lic = _license_payload(tid)
     return jsonify({"ok": True, "identity": g.device["identity"],
                     "disabled": get_disabled(g.device["identity"], tid),
+                    "screenshots": lic["features"]["screenshots_enabled"],
+                    "plan": lic["plan"],
                     "server_time": now_iso()})
 
 
